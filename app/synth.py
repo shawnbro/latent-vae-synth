@@ -194,6 +194,11 @@ class BiquadFilter:
         self._b2, self._a2 = self._biquad_lp(Q2)
         # zi1/zi2 deliberately NOT touched — state persists for smooth modulation
 
+    def reset(self):
+        """Clear filter memory. Call on fresh note starts to prevent clicks from stale state."""
+        self._zi1 = np.zeros(2)
+        self._zi2 = np.zeros(2)
+
     def process(self, x: np.ndarray) -> np.ndarray:
         x64 = x.astype(np.float64)
         y,  self._zi1 = lfilter(self._b1, self._a1, x64, zi=self._zi1)
@@ -243,6 +248,8 @@ class LatentSynth:
         self._held_notes[midi_note] = vel   # update or add (preserves insertion order)
         self._frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
         self._velocity  = vel
+        if self.envelope.state == ADSREnvelope.IDLE:
+            self.filt.reset()   # clear stale filter state so it doesn't bleed into the attack
         self.envelope.note_on()
 
     def note_off(self, midi_note: int):
