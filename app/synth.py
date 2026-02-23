@@ -21,7 +21,7 @@ import tkinter as tk
 import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
-from scipy.signal import lfilter, lfilter_zi
+from scipy.signal import lfilter
 
 try:
     import pygame
@@ -147,19 +147,22 @@ class ADSREnvelope:
 
 class BiquadFilter:
     """
-    Two-pole resonant lowpass filter.
+    Four-pole resonant lowpass filter (two cascaded biquad stages, 24 dB/oct).
 
-    Coefficients are recomputed whenever cutoff or resonance change.
-    State (zi) persists across blocks for continuous filtering.
+    Stage 1 uses a fixed Butterworth Q for a flat passband.
+    Stage 2 adds resonance — increasing Q creates a peak near cutoff.
+
+    Key design: filter state (zi) is NOT reset when coefficients change.
+    This allows smooth real-time cutoff modulation without artifacts.
     """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sr        = float(sample_rate)
         self.cutoff_hz = 18000.0
         self.resonance = 0.0
-        self._b        = np.array([1.0, 0.0, 0.0])
-        self._a        = np.array([1.0, 0.0, 0.0])
-        self._zi       = np.zeros(2)
+        # State for each biquad stage — intentionally preserved across coeff updates
+        self._zi1 = np.zeros(2)
+        self._zi2 = np.zeros(2)
         self._update_coeffs()
 
     def set_cutoff(self, hz: float):
@@ -167,29 +170,34 @@ class BiquadFilter:
         self._update_coeffs()
 
     def set_resonance(self, r: float):
-        self.resonance = float(np.clip(r, 0.0, 0.97))
+        self.resonance = float(np.clip(r, 0.0, 0.95))
         self._update_coeffs()
 
-    def _update_coeffs(self):
-        Q  = 0.707 + self.resonance * 11.3
-        w0 = 2.0 * np.pi * self.cutoff_hz / self.sr
+    def _biquad_lp(self, Q: float):
+        w0     = 2.0 * np.pi * self.cutoff_hz / self.sr
         cos_w0 = np.cos(w0)
         alpha  = np.sin(w0) / (2.0 * Q)
-
         b0 = (1.0 - cos_w0) / 2.0
         b1 =  1.0 - cos_w0
         b2 = (1.0 - cos_w0) / 2.0
         a0 =  1.0 + alpha
         a1 = -2.0 * cos_w0
         a2 =  1.0 - alpha
+        return (np.array([b0/a0, b1/a0, b2/a0]),
+                np.array([1.0,   a1/a0, a2/a0]))
 
-        self._b = np.array([b0 / a0, b1 / a0, b2 / a0])
-        self._a = np.array([1.0,     a1 / a0, a2 / a0])
-        self._zi = lfilter_zi(self._b, self._a) * self._zi[0]
+    def _update_coeffs(self):
+        # 4th-order Butterworth pole-pair Q values; resonance boosts stage 2
+        Q1 = 0.5412139                              # Butterworth stage 1 (flat)
+        Q2 = 1.3065630 + self.resonance * 10.0     # Butterworth stage 2 + resonance peak
+        self._b1, self._a1 = self._biquad_lp(Q1)
+        self._b2, self._a2 = self._biquad_lp(Q2)
+        # zi1/zi2 deliberately NOT touched — state persists for smooth modulation
 
     def process(self, x: np.ndarray) -> np.ndarray:
-        y, self._zi = lfilter(self._b, self._a,
-                               x.astype(np.float64), zi=self._zi)
+        x64 = x.astype(np.float64)
+        y,  self._zi1 = lfilter(self._b1, self._a1, x64, zi=self._zi1)
+        y,  self._zi2 = lfilter(self._b2, self._a2, y,   zi=self._zi2)
         return np.clip(y, -1.0, 1.0).astype(np.float32)
 
 
@@ -202,11 +210,12 @@ class LatentSynth:
         self.session = ort.InferenceSession(
             onnx_path, providers=["CPUExecutionProvider"])
 
-        self._waveform  = np.zeros(WAVEFORM_LEN, dtype=np.float32)
-        self._phase     = 0.0
-        self._frequency = 0.0
-        self._velocity  = 0.0
-        self._gain      = 0.8   # master output gain (0-1)
+        self._waveform   = np.zeros(WAVEFORM_LEN, dtype=np.float32)
+        self._phase      = 0.0
+        self._frequency  = 0.0
+        self._velocity   = 0.0
+        self._gain       = 0.8   # master output gain (0-1)
+        self._held_notes = {}    # midi_note → velocity (0-1), insertion order = press order
 
         self.envelope   = ADSREnvelope(SAMPLE_RATE)
         self.filt       = BiquadFilter(SAMPLE_RATE)
@@ -230,12 +239,22 @@ class LatentSynth:
     # ------------------------------------------------------------------
 
     def note_on(self, midi_note: int, velocity: int):
+        vel = velocity / 127.0
+        self._held_notes[midi_note] = vel   # update or add (preserves insertion order)
         self._frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
-        self._velocity  = velocity / 127.0
+        self._velocity  = vel
         self.envelope.note_on()
 
     def note_off(self, midi_note: int):
-        self.envelope.note_off()
+        self._held_notes.pop(midi_note, None)
+        if self._held_notes:
+            # Last-note priority: fall back to the most recently pressed held note
+            last_note = list(self._held_notes.keys())[-1]
+            self._frequency = 440.0 * (2.0 ** ((last_note - 69) / 12.0))
+            self._velocity  = self._held_notes[last_note]
+            # No envelope retrigger — legato behaviour
+        else:
+            self.envelope.note_off()
 
     # ------------------------------------------------------------------
     # Param setters  (called from UI thread)
