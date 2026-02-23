@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Dataset & generated cache  (too large for git — see README for download)
+data/akwf/
+data/akwf_cache.pt
+
+# Training checkpoints — keep best.pt, ignore per-epoch saves
+model/checkpoints/epoch_*.pt
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code internal
+.claude/

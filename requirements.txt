@@ -1,0 +1,11 @@
+torch>=2.10
+torchaudio>=2.10
+soundfile
+numpy
+scipy
+onnx
+onnxruntime
+onnxscript
+sounddevice
+pygame
+matplotlib
