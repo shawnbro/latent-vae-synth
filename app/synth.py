@@ -10,6 +10,7 @@ Controls:
     - Use ADSR sliders to shape the amplitude envelope
     - Use Filter sliders to control brightness and resonance
     - Use Motion panel: LFO auto-cycling, Z0/Z1 scan sliders, Randomize
+    - Use Arpeggiator panel: step arp with per-step latent positions
     - Gain slider in I/O panel controls master output level
 """
 
@@ -17,6 +18,7 @@ import sys
 import os
 import argparse
 import threading
+import dataclasses
 import tkinter as tk
 import numpy as np
 import sounddevice as sd
@@ -42,6 +44,7 @@ BLOCK_SIZE   = 512
 WAVEFORM_LEN = 2048
 LATENT_MIN   = -4.0
 LATENT_MAX   =  4.0
+MAX_VOICES   = 8
 PAD_SIZE     = 360
 WAVE_WIDTH   = 360
 WAVE_HEIGHT  = 90
@@ -59,6 +62,13 @@ FONT_SYS    = ("Monaco", 10)
 FONT_LABEL  = ("Geneva", 10)
 FONT_SMALL  = ("Monaco", 9)
 FONT_TINY   = ("Monaco", 8)
+
+ARP_MAX_STEPS    = 4
+ARP_MIN_BPM      = 20.0
+ARP_MAX_BPM      = 480.0
+ARP_DEFAULT_BPM  = 120.0
+ARP_DEFAULT_GATE = 0.8    # fraction of step duration, 0.05–1.0
+ARP_TICK_HZ      = 200.0  # scheduler resolution (5 ms)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +217,255 @@ class BiquadFilter:
 
 
 # ---------------------------------------------------------------------------
+# Arpeggiator
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class ArpStep:
+    x:        float             = 0.0
+    y:        float             = 0.0
+    waveform: np.ndarray | None = None  # pre-decoded; None while decoding
+
+
+class Arpeggiator:
+    """
+    Background daemon thread that fires arp notes at a set BPM.
+
+    Each of the ARP_MAX_STEPS steps has its own latent position (decoded
+    waveform). Held MIDI notes supply pitches; the arp cycles through them
+    in the selected order. Per-step waveforms are decoded in background
+    threads so the scheduler thread is never blocked by ONNX.
+    """
+
+    def __init__(self, synth, decode_fn, step_callback=None):
+        self._synth         = synth
+        self._decode_fn     = decode_fn        # callable(x, y) → np.ndarray
+        self._step_callback = step_callback or (lambda i: None)
+
+        self.bpm     = ARP_DEFAULT_BPM
+        self.gate    = ARP_DEFAULT_GATE
+        self.n_steps = ARP_MAX_STEPS
+        self.order   = "up"   # "up" | "down" | "up-down" | "random"
+
+        self._steps       = [ArpStep() for _ in range(ARP_MAX_STEPS)]
+        self._held_notes  = []
+        self._held_lock   = threading.Lock()
+        self._active_note = None
+        self._step_idx    = 0
+        self._direction   = 1
+        self._rng         = np.random.default_rng()
+
+        self.active  = False
+        self._thread = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self):
+        if self.active:
+            return
+        self._step_idx = 0
+        self._direction = 1
+        self.active  = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.active = False
+        if self._active_note is not None:
+            self._synth._voice_note_off(self._active_note)
+            self._active_note = None
+
+    def set_bpm(self, bpm: float):
+        self.bpm = float(np.clip(bpm, ARP_MIN_BPM, ARP_MAX_BPM))
+
+    def set_gate(self, frac: float):
+        self.gate = float(np.clip(frac, 0.05, 1.0))
+
+    def set_n_steps(self, n: int):
+        self.n_steps = int(np.clip(n, 1, ARP_MAX_STEPS))
+        # Keep step_idx in bounds
+        if self._step_idx >= self.n_steps:
+            self._step_idx = 0
+
+    def set_order(self, order: str):
+        self.order = order
+        self._direction = 1
+
+    def set_step_latent(self, idx: int, x: float, y: float):
+        """Update a step's latent position and trigger a background decode."""
+        step = self._steps[idx]
+        step.x = x
+        step.y = y
+        step.waveform = None   # invalidate until decode completes
+        threading.Thread(
+            target=self._decode_step, args=(idx, x, y), daemon=True
+        ).start()
+
+    def add_held(self, midi_note: int):
+        with self._held_lock:
+            if midi_note not in self._held_notes:
+                self._held_notes.append(midi_note)
+
+    def remove_held(self, midi_note: int):
+        with self._held_lock:
+            try:
+                self._held_notes.remove(midi_note)
+            except ValueError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Background waveform decode
+    # ------------------------------------------------------------------
+
+    def _decode_step(self, idx: int, x: float, y: float):
+        wf = self._decode_fn(x, y)
+        step = self._steps[idx]
+        if step.x == x and step.y == y:   # staleness guard
+            step.waveform = wf            # GIL-atomic reference write
+
+    # ------------------------------------------------------------------
+    # Scheduling thread
+    # ------------------------------------------------------------------
+
+    def _pick_note(self, held):
+        """Select pitch from held notes based on current order and step."""
+        if self.order == "up":
+            notes = sorted(held)
+        elif self.order == "down":
+            notes = sorted(held, reverse=True)
+        elif self.order == "up-down":
+            notes = sorted(held)
+        else:  # random
+            return int(self._rng.choice(held))
+        return notes[self._step_idx % len(notes)]
+
+    def _advance_step(self):
+        """Move _step_idx forward according to the current order."""
+        n = self.n_steps
+        if self.order in ("up", "random"):
+            self._step_idx = (self._step_idx + 1) % n
+        elif self.order == "down":
+            self._step_idx = (self._step_idx - 1 + n) % n
+        else:  # up-down
+            next_idx = self._step_idx + self._direction
+            if next_idx >= n:
+                self._direction = -1
+                self._step_idx  = max(0, n - 2)
+            elif next_idx < 0:
+                self._direction = 1
+                self._step_idx  = min(1, n - 1)
+            else:
+                self._step_idx = next_idx
+
+    def _run(self):
+        while self.active:
+            step_duration = 60.0 / max(self.bpm, 1.0)
+            gate          = float(np.clip(self.gate, 0.05, 1.0))
+            n             = self.n_steps
+            step          = self._steps[self._step_idx % ARP_MAX_STEPS]
+
+            with self._held_lock:
+                held = list(self._held_notes)
+
+            if held:
+                note = self._pick_note(held)
+
+                # Notify UI before sleeping
+                self._step_callback(self._step_idx % n)
+
+                # Release previous note (ADSR release tail keeps sounding)
+                if self._active_note is not None:
+                    self._synth._voice_note_off(self._active_note)
+
+                # Trigger this step's note with its own waveform
+                self._synth.arp_note_on(note, 100, step.waveform)
+                self._active_note = note
+
+                # Hold for gate fraction
+                threading.Event().wait(step_duration * gate)
+
+                # Release (ADSR handles the tail)
+                self._synth._voice_note_off(note)
+                self._active_note = None
+
+                # Rest for remaining step time
+                remaining = step_duration * (1.0 - gate)
+                if remaining > 1e-3:
+                    threading.Event().wait(remaining)
+            else:
+                # No keys held — silence any lingering note and wait
+                if self._active_note is not None:
+                    self._synth._voice_note_off(self._active_note)
+                    self._active_note = None
+                threading.Event().wait(step_duration)
+
+            self._advance_step()
+
+
+# ---------------------------------------------------------------------------
+# Polyphonic voice
+# ---------------------------------------------------------------------------
+
+class Voice:
+    def __init__(self):
+        self.midi_note  = None
+        self._phase     = 0.0
+        self._frequency = 0.0
+        self._velocity  = 0.0
+        self.envelope   = ADSREnvelope(SAMPLE_RATE)
+        self.filt       = BiquadFilter(SAMPLE_RATE)
+        self._own_waveform: np.ndarray | None = None
+
+    @property
+    def active(self):
+        return self.envelope.state != ADSREnvelope.IDLE
+
+    def note_on(self, midi_note: int, velocity: int, cutoff: float, resonance: float,
+                waveform: np.ndarray | None = None):
+        self.midi_note  = midi_note
+        self._frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+        self._velocity  = velocity / 127.0
+        self._own_waveform = waveform      # None → use global; array → per-voice
+        self.filt.set_cutoff(cutoff)
+        self.filt.set_resonance(resonance)
+        if self.envelope.state == ADSREnvelope.IDLE:
+            self.filt.reset()   # clear stale filter state on fresh starts only
+        self.envelope.note_on()
+
+    def note_off(self):
+        self.envelope.note_off()
+        self.midi_note = None
+
+    def render(self, frames: int, waveform: np.ndarray,
+               base_cutoff: float, env_amount: float) -> np.ndarray | None:
+        """Render one audio block. Returns None if idle."""
+        if not self.active:
+            return None
+
+        # Use per-voice waveform if set (arp), otherwise fall back to global
+        wf        = self._own_waveform if self._own_waveform is not None else waveform
+        phase_inc = WAVEFORM_LEN * self._frequency / SAMPLE_RATE
+        phases    = (self._phase + np.arange(frames, dtype=np.float64) * phase_inc) % WAVEFORM_LEN
+        idx       = phases.astype(np.int32)
+        frac      = (phases - idx).astype(np.float32)
+        next_idx  = (idx + 1) % WAVEFORM_LEN
+        samples   = wf[idx] * (1.0 - frac) + wf[next_idx] * frac
+        self._phase = (self._phase + frames * phase_inc) % WAVEFORM_LEN
+
+        env = self.envelope.process(frames)
+
+        if env_amount > 0.0:
+            env_level  = float(env.mean())
+            mod_cutoff = base_cutoff + env_amount * (18000.0 - base_cutoff) * env_level
+            self.filt.set_cutoff(mod_cutoff)
+
+        samples = self.filt.process(samples)
+        return samples * env * self._velocity
+
+
+# ---------------------------------------------------------------------------
 # Wavetable oscillator / audio engine
 # ---------------------------------------------------------------------------
 
@@ -215,19 +474,28 @@ class LatentSynth:
         self.session = ort.InferenceSession(
             onnx_path, providers=["CPUExecutionProvider"])
 
-        self._waveform   = np.zeros(WAVEFORM_LEN, dtype=np.float32)
-        self._phase      = 0.0
-        self._frequency  = 0.0
-        self._velocity   = 0.0
+        self._waveform_from = np.zeros(WAVEFORM_LEN, dtype=np.float32)
+        self._waveform_to   = np.zeros(WAVEFORM_LEN, dtype=np.float32)
+        self._morph         = 1.0   # 0.0 = fully _from, 1.0 = fully _to
+        self._morph_rate    = 0.0   # fraction of morph per audio block; 0 = instant
         self._gain       = 0.8   # master output gain (0-1)
-        self._held_notes = {}    # midi_note → velocity (0-1), insertion order = press order
 
-        self.envelope   = ADSREnvelope(SAMPLE_RATE)
-        self.filt       = BiquadFilter(SAMPLE_RATE)
+        self._voices    = [Voice() for _ in range(MAX_VOICES)]
+        self._resonance = 0.0   # stored so note_on can initialise stolen/reused voices
         self._base_cutoff  = 18000.0
         self._env_amount   = 0.0
 
         self.set_latent(0.0, 0.0)
+
+        # Arpeggiator
+        self._arp_enabled = False
+        self.arp = Arpeggiator(
+            synth     = self,
+            decode_fn = self._decode_latent,
+        )
+        # Initialise all step waveforms from the already-decoded default waveform
+        for step in self.arp._steps:
+            step.waveform = self._waveform_to.copy()
 
     # ------------------------------------------------------------------
     # Latent navigation
@@ -235,50 +503,125 @@ class LatentSynth:
 
     def set_latent(self, x: float, y: float):
         z = np.array([[x, y]], dtype=np.float32)
-        raw = self.session.run(["waveform"], {"latent": z})[0]
-        self._waveform = raw[0, 0].astype(np.float32)
-        return self._waveform
+        new_wf = self.session.run(["waveform"], {"latent": z})[0][0, 0].astype(np.float32)
+
+        if self._morph_rate > 0.0 and self._morph < 1.0:
+            # Mid-transition: freeze the current blend position as the new "from"
+            t = float(self._morph)
+            self._waveform_from = (1.0 - t) * self._waveform_from + t * self._waveform_to
+        else:
+            self._waveform_from = self._waveform_to   # previous target becomes new start
+
+        self._waveform_to = new_wf
+        # With glide off, snap immediately; otherwise restart morph from 0
+        self._morph = 1.0 if self._morph_rate == 0.0 else 0.0
+        return new_wf
+
+    def set_glide(self, ms: float):
+        if ms <= 0.0:
+            self._morph_rate = 0.0
+        else:
+            glide_samples = ms * SAMPLE_RATE / 1000.0
+            self._morph_rate = BLOCK_SIZE / glide_samples
+
+    def _decode_latent(self, x: float, y: float) -> np.ndarray:
+        """ONNX inference — thread-safe (session is stateless)."""
+        z = np.array([[x, y]], dtype=np.float32)
+        return self.session.run(["waveform"], {"latent": z})[0][0, 0].astype(np.float32)
 
     # ------------------------------------------------------------------
     # MIDI
     # ------------------------------------------------------------------
 
     def note_on(self, midi_note: int, velocity: int):
-        vel = velocity / 127.0
-        self._held_notes[midi_note] = vel   # update or add (preserves insertion order)
-        self._frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
-        self._velocity  = vel
-        if self.envelope.state == ADSREnvelope.IDLE:
-            self.filt.reset()   # clear stale filter state so it doesn't bleed into the attack
-        self.envelope.note_on()
+        if self._arp_enabled:
+            self.arp.add_held(midi_note)
+            return
+
+        # Retrigger if already playing this note
+        for v in self._voices:
+            if v.midi_note == midi_note:
+                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
+                return
+
+        # Prefer a free (IDLE) voice
+        for v in self._voices:
+            if not v.active:
+                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
+                return
+
+        # Steal: quietest releasing voice first, then quietest overall
+        best = min(
+            (v for v in self._voices if v.envelope.state == ADSREnvelope.RELEASE),
+            key=lambda v: v.envelope.level,
+            default=None,
+        )
+        if best is None:
+            best = min(self._voices, key=lambda v: v.envelope.level)
+        best.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
 
     def note_off(self, midi_note: int):
-        self._held_notes.pop(midi_note, None)
-        if self._held_notes:
-            # Last-note priority: fall back to the most recently pressed held note
-            last_note = list(self._held_notes.keys())[-1]
-            self._frequency = 440.0 * (2.0 ** ((last_note - 69) / 12.0))
-            self._velocity  = self._held_notes[last_note]
-            # No envelope retrigger — legato behaviour
-        else:
-            self.envelope.note_off()
+        if self._arp_enabled:
+            self.arp.remove_held(midi_note)
+            return
+        for v in self._voices:
+            if v.midi_note == midi_note:
+                v.note_off()
+                return
+
+    def arp_note_on(self, midi_note: int, velocity: int,
+                    waveform: np.ndarray | None = None):
+        """Trigger a voice for the arpeggiator with an optional per-step waveform."""
+        # Retrigger if already playing this note
+        for v in self._voices:
+            if v.midi_note == midi_note:
+                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance,
+                          waveform=waveform)
+                return
+
+        # Prefer a free (IDLE) voice
+        for v in self._voices:
+            if not v.active:
+                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance,
+                          waveform=waveform)
+                return
+
+        # Steal: quietest releasing voice first, then quietest overall
+        best = min(
+            (v for v in self._voices if v.envelope.state == ADSREnvelope.RELEASE),
+            key=lambda v: v.envelope.level,
+            default=None,
+        )
+        if best is None:
+            best = min(self._voices, key=lambda v: v.envelope.level)
+        best.note_on(midi_note, velocity, self._base_cutoff, self._resonance,
+                     waveform=waveform)
+
+    def _voice_note_off(self, midi_note: int):
+        """Direct voice release — used by Arpeggiator (bypasses arp routing)."""
+        for v in self._voices:
+            if v.midi_note == midi_note:
+                v.note_off()
+                return
 
     # ------------------------------------------------------------------
     # Param setters  (called from UI thread)
     # ------------------------------------------------------------------
 
-    def set_attack(self,  ms):    self.envelope.set_attack(ms)
-    def set_decay(self,   ms):    self.envelope.set_decay(ms)
-    def set_sustain(self, level): self.envelope.set_sustain(level)
-    def set_release(self, ms):    self.envelope.set_release(ms)
+    def set_attack(self,  ms):    [v.envelope.set_attack(ms)     for v in self._voices]
+    def set_decay(self,   ms):    [v.envelope.set_decay(ms)      for v in self._voices]
+    def set_sustain(self, level): [v.envelope.set_sustain(level) for v in self._voices]
+    def set_release(self, ms):    [v.envelope.set_release(ms)    for v in self._voices]
 
     def set_cutoff(self, hz):
         self._base_cutoff = hz
-        if self._env_amount == 0.0:
-            self.filt.set_cutoff(hz)
+        for v in self._voices:
+            v.filt.set_cutoff(hz)
 
     def set_filter_resonance(self, r):
-        self.filt.set_resonance(r)
+        self._resonance = r
+        for v in self._voices:
+            v.filt.set_resonance(r)
 
     def set_env_amount(self, amount):
         self._env_amount = float(np.clip(amount, 0.0, 1.0))
@@ -287,41 +630,62 @@ class LatentSynth:
         self._gain = float(np.clip(g, 0.0, 1.0))
 
     # ------------------------------------------------------------------
+    # Arpeggiator control
+    # ------------------------------------------------------------------
+
+    def set_arp_enabled(self, enabled: bool):
+        self._arp_enabled = enabled
+        if enabled:
+            self.arp.start()
+        else:
+            self.arp.stop()
+            for v in self._voices:   # release any arp-held voices
+                if v.active:
+                    v.note_off()
+
+    def set_arp_bpm(self, bpm):          self.arp.set_bpm(bpm)
+    def set_arp_gate(self, frac):        self.arp.set_gate(frac)
+    def set_arp_steps(self, n):          self.arp.set_n_steps(n)
+    def set_arp_order(self, order):      self.arp.set_order(order)
+    def set_step_latent(self, idx, x, y): self.arp.set_step_latent(idx, x, y)
+
+    # ------------------------------------------------------------------
     # Audio callback  (runs on sounddevice thread)
     # ------------------------------------------------------------------
 
     def audio_callback(self, outdata, frames, time_info, status):
-        waveform  = self._waveform
-        frequency = self._frequency
-        velocity  = self._velocity
+        # Snapshot morph state atomically at block start
+        morph      = self._morph
+        wf_from    = self._waveform_from
+        wf_to      = self._waveform_to
+        morph_rate = self._morph_rate
 
-        if frequency <= 0.0:
-            outdata[:, 0] = 0.0
-            return
+        # Advance morph for next block
+        if morph < 1.0:
+            self._morph = min(1.0, morph + morph_rate)
 
-        # ── 1. Vectorised wavetable oscillator ────────────────────────
-        phase_inc = WAVEFORM_LEN * frequency / SAMPLE_RATE
-        phases    = (self._phase + np.arange(frames, dtype=np.float64) * phase_inc) % WAVEFORM_LEN
-        idx       = phases.astype(np.int32)
-        frac      = (phases - idx).astype(np.float32)
-        next_idx  = (idx + 1) % WAVEFORM_LEN
-        samples   = waveform[idx] * (1.0 - frac) + waveform[next_idx] * frac
-        self._phase = (self._phase + frames * phase_inc) % WAVEFORM_LEN
+        # Compute effective waveform for this block
+        if morph >= 1.0:
+            waveform = wf_to
+        else:
+            waveform = (1.0 - morph) * wf_from + morph * wf_to
 
-        # ── 2. ADSR envelope ──────────────────────────────────────────
-        env = self.envelope.process(frames)
+        # ── Mix voices ────────────────────────────────────────────────
+        base_cutoff = self._base_cutoff
+        env_amount  = self._env_amount
+        mix         = np.zeros(frames, dtype=np.float32)
+        n_active    = 0
 
-        # ── 3. Filter envelope modulation ─────────────────────────────
-        if self._env_amount > 0.0:
-            env_level = float(env.mean())
-            mod_cutoff = self._base_cutoff + self._env_amount * (18000.0 - self._base_cutoff) * env_level
-            self.filt.set_cutoff(mod_cutoff)
+        for v in self._voices:
+            rendered = v.render(frames, waveform, base_cutoff, env_amount)
+            if rendered is not None:
+                mix      += rendered
+                n_active += 1
 
-        # ── 4. Biquad lowpass filter ───────────────────────────────────
-        samples = self.filt.process(samples)
+        if n_active > 0:
+            mix *= self._gain / (n_active ** 0.5)
 
-        # ── 5. Apply envelope × velocity × master gain ────────────────
-        outdata[:, 0] = samples * env * velocity * self._gain
+        outdata[:, 0] = mix
 
     # ------------------------------------------------------------------
     # Audio stream management
@@ -552,7 +916,11 @@ class SynthUI:
         )
 
         self._build_ui()
-        self._update_waveform_display(synth._waveform)
+        self._update_waveform_display(synth._waveform_to)
+
+        # Wire arp step highlight callback (after _build_ui creates the labels)
+        self.synth.arp._step_callback = lambda i: self.root.after(
+            0, self._highlight_arp_step, i)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -662,6 +1030,7 @@ class SynthUI:
         self._build_envelope_panel(right_col)
         self._build_filter_panel(right_col)
         self._build_motion_panel(right_col)
+        self._build_arpeggiator_panel(right_col)
         self._build_io_panel(right_col)
 
     # ------------------------------------------------------------------
@@ -845,6 +1214,8 @@ class SynthUI:
             "Rate:",  1, 100, 20, self._on_lfo_rate)
         self._lfo_depth_sl, self._lfo_depth_lbl = make_row(
             "Depth:", 0, 100, 50, self._on_lfo_depth)
+        self._glide_sl, self._glide_lbl = make_row(
+            "Glide:", 0, 1000, 0, self._on_glide)
         self._z0_sl, self._z0_lbl = make_row(
             "Z0:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z0_scan, res=0.01)
         self._z1_sl, self._z1_lbl = make_row(
@@ -898,6 +1269,14 @@ class SynthUI:
         d = float(val) / 100.0 * 4.0
         self.lfo.depth = d
         self._lfo_depth_lbl.config(text=f"{d:.2f}")
+
+    def _on_glide(self, val):
+        ms = float(val)
+        self.synth.set_glide(ms)
+        if ms == 0:
+            self._glide_lbl.config(text="off")
+        else:
+            self._glide_lbl.config(text=f"{ms:.0f} ms")
 
     def _on_z0_scan(self, val):
         if self._in_scan_update:
@@ -964,6 +1343,173 @@ class SynthUI:
             self._update_scan_sliders(x, y)
         else:
             self._move_to_latent(x, y)
+
+    # ------------------------------------------------------------------
+    # Arpeggiator panel
+    # ------------------------------------------------------------------
+
+    def _build_arpeggiator_panel(self, parent):
+        panel = mac_frame(parent)
+        panel.pack(fill="x", pady=(0, 6))
+
+        tk.Label(panel, text="◆ Arpeggiator",
+                 font=("Monaco", 9, "bold"),
+                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
+
+        inner = tk.Frame(panel, bg=MAC_BG)
+        inner.pack(padx=8, pady=(0, 6), fill="x")
+
+        # Row 1: ARP toggle + Steps buttons
+        row1 = tk.Frame(inner, bg=MAC_BG)
+        row1.pack(fill="x", pady=(0, 2))
+
+        self._arp_btn = mac_button(row1, "ARP: OFF", self._toggle_arp, width=8)
+        self._arp_btn.pack(side="left", padx=(0, 6))
+
+        tk.Label(row1, text="Steps:", font=FONT_TINY,
+                 fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+        self._arp_step_btns = []
+        for i in range(1, ARP_MAX_STEPS + 1):
+            b = mac_button(row1, str(i), lambda n=i: self._set_arp_steps(n), width=2)
+            b.pack(side="left", padx=1)
+            self._arp_step_btns.append(b)
+
+        # Row 2: Order radio buttons
+        row2 = tk.Frame(inner, bg=MAC_BG)
+        row2.pack(fill="x", pady=2)
+
+        tk.Label(row2, text="Order:", font=FONT_TINY,
+                 fg=MAC_BLACK, bg=MAC_BG, width=7, anchor="w").pack(side="left")
+
+        self._arp_order_var = tk.StringVar(value="up")
+        for label, val in [("Up", "up"), ("Down", "down"),
+                            ("U-D", "up-down"), ("Rand", "random")]:
+            tk.Radiobutton(
+                row2, text=label, variable=self._arp_order_var, value=val,
+                font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG,
+                activebackground=MAC_BG, selectcolor=MAC_BG,
+                command=self._on_arp_order,
+            ).pack(side="left", padx=2)
+
+        # BPM / Gate sliders
+        def make_row(label, from_, to, init, cmd, res=0):
+            row = tk.Frame(inner, bg=MAC_BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
+                     bg=MAC_BG, width=7, anchor="w").pack(side="left")
+            s = mac_slider(row, from_=from_, to=to, command=cmd,
+                           length=130, orient=tk.HORIZONTAL, resolution=res)
+            s.set(init)
+            s.pack(side="left")
+            lbl = tk.Label(row, text="", font=FONT_TINY,
+                           fg=MAC_BLACK, bg=MAC_BG, width=7, anchor="w")
+            lbl.pack(side="left", padx=(3, 0))
+            return s, lbl
+
+        self._arp_bpm_sl,  self._arp_bpm_lbl  = make_row(
+            "BPM:",  ARP_MIN_BPM, ARP_MAX_BPM, ARP_DEFAULT_BPM,
+            self._on_arp_bpm, res=1)
+        self._arp_gate_sl, self._arp_gate_lbl = make_row(
+            "Gate:", 5, 100, int(ARP_DEFAULT_GATE * 100),
+            self._on_arp_gate, res=1)
+
+        # Divider
+        tk.Frame(inner, bg=MAC_SHADOW, height=1).pack(fill="x", pady=(4, 2))
+
+        # Step rows — each has a label, z0 slider, z1 slider, capture button
+        self._arp_step_labels = []
+        self._arp_step_z0_sls = []
+        self._arp_step_z1_sls = []
+
+        for i in range(ARP_MAX_STEPS):
+            row = tk.Frame(inner, bg=MAC_BG)
+            row.pack(fill="x", pady=1)
+
+            lbl = tk.Label(row, text=f"Step {i+1}:", font=FONT_TINY,
+                           fg=MAC_BLACK, bg=MAC_BG, width=7, anchor="w")
+            lbl.pack(side="left")
+            self._arp_step_labels.append(lbl)
+
+            tk.Label(row, text="z0", font=FONT_TINY,
+                     fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+            z0_sl = mac_slider(
+                row, from_=LATENT_MIN, to=LATENT_MAX,
+                command=lambda v, idx=i: self._on_arp_step_latent(idx),
+                length=75, orient=tk.HORIZONTAL, resolution=0.01)
+            z0_sl.set(0.0)
+            z0_sl.pack(side="left")
+            self._arp_step_z0_sls.append(z0_sl)
+
+            tk.Label(row, text=" z1", font=FONT_TINY,
+                     fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+            z1_sl = mac_slider(
+                row, from_=LATENT_MIN, to=LATENT_MAX,
+                command=lambda v, idx=i: self._on_arp_step_latent(idx),
+                length=75, orient=tk.HORIZONTAL, resolution=0.01)
+            z1_sl.set(0.0)
+            z1_sl.pack(side="left")
+            self._arp_step_z1_sls.append(z1_sl)
+
+            mac_button(row, "◉", lambda idx=i: self._grab_step_pos(idx),
+                       width=2).pack(side="left", padx=(3, 0))
+
+        # Apply defaults and set initial visual state
+        self._on_arp_bpm(ARP_DEFAULT_BPM)
+        self._on_arp_gate(int(ARP_DEFAULT_GATE * 100))
+        self._set_arp_steps(ARP_MAX_STEPS)   # all 4 steps active initially
+        self._highlight_arp_step(0)
+
+    # ------------------------------------------------------------------
+    # Arpeggiator callbacks
+    # ------------------------------------------------------------------
+
+    def _toggle_arp(self):
+        enabled = not self.synth._arp_enabled
+        self.synth.set_arp_enabled(enabled)
+        self._arp_btn.config(text="ARP: ON " if enabled else "ARP: OFF")
+
+    def _set_arp_steps(self, n: int):
+        self.synth.set_arp_steps(n)
+        for i, b in enumerate(self._arp_step_btns):
+            b.config(relief="sunken" if (i + 1) <= n else "raised")
+
+    def _on_arp_order(self):
+        self.synth.set_arp_order(self._arp_order_var.get())
+
+    def _on_arp_bpm(self, val):
+        bpm = float(val)
+        self.synth.set_arp_bpm(bpm)
+        self._arp_bpm_lbl.config(text=f"{bpm:.0f}")
+
+    def _on_arp_gate(self, val):
+        frac = float(val) / 100.0
+        self.synth.set_arp_gate(frac)
+        self._arp_gate_lbl.config(text=f"{int(float(val))}%")
+
+    def _on_arp_step_latent(self, idx: int):
+        """Called when either z0 or z1 slider for a step changes."""
+        x = float(self._arp_step_z0_sls[idx].get())
+        y = float(self._arp_step_z1_sls[idx].get())
+        self.synth.set_step_latent(idx, x, y)
+
+    def _grab_step_pos(self, idx: int):
+        """Capture the current XY pad position into step idx."""
+        x = self._latent_x
+        y = self._latent_y
+        self._arp_step_z0_sls[idx].set(x)
+        self._arp_step_z1_sls[idx].set(y)
+        self.synth.set_step_latent(idx, x, y)
+
+    def _highlight_arp_step(self, active_idx: int):
+        """Bold the active step label; dim all others."""
+        for i, lbl in enumerate(self._arp_step_labels):
+            if i == active_idx:
+                lbl.config(font=("Monaco", 8, "bold"))
+            else:
+                lbl.config(font=FONT_TINY)
 
     # ------------------------------------------------------------------
     # I/O panel
@@ -1189,6 +1735,7 @@ class SynthUI:
 
     def _on_close(self):
         self.lfo.stop()
+        self.synth.arp.stop()
         self.synth.stop_audio()
         self.midi.close()
         self.root.destroy()
