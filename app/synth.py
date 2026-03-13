@@ -70,6 +70,16 @@ ARP_DEFAULT_BPM  = 120.0
 ARP_DEFAULT_GATE = 0.8    # fraction of step duration, 0.05–1.0
 ARP_TICK_HZ      = 200.0  # scheduler resolution (5 ms)
 
+# Keyboard piano input
+KB_NOTE_MAP: dict[str, int] = {
+    "a": 0,  "w": 1,  "s": 2,  "e": 3,  "d": 4,
+    "f": 5,  "t": 6,  "g": 7,  "y": 8,  "h": 9,
+    "u": 10, "j": 11, "k": 12, "o": 13, "l": 14,
+}
+KB_DEFAULT_OCTAVE   = 4
+KB_DEFAULT_VELOCITY = 100
+KB_VELOCITY_STEP    = 10
+
 
 # ---------------------------------------------------------------------------
 # ADSR Envelope
@@ -910,6 +920,11 @@ class SynthUI:
         self._randomize_job  = None    # pending after_cancel handle
         self._lfo_tick       = 0       # rate-limit waveform display during LFO
 
+        self._kb_active   = False
+        self._kb_octave   = KB_DEFAULT_OCTAVE
+        self._kb_velocity = KB_DEFAULT_VELOCITY
+        self._kb_held     = set()   # held keysyms — prevents OS key-repeat flood
+
         # LFO: callback fires on main thread via root.after
         self.lfo = LatentLFO(
             lambda x, y: self.root.after(0, self._lfo_update, x, y)
@@ -917,6 +932,7 @@ class SynthUI:
 
         self._build_ui()
         self._update_waveform_display(synth._waveform_to)
+        self._setup_keyboard_input()
 
         # Wire arp step highlight callback (after _build_ui creates the labels)
         self.synth.arp._step_callback = lambda i: self.root.after(
@@ -1580,9 +1596,96 @@ class SynthUI:
         audio_menu["menu"].config(font=FONT_TINY, bg=MAC_WHITE)
         audio_menu.pack(side="left")
 
+        # Keyboard row
+        kbd_row = tk.Frame(inner, bg=MAC_BG)
+        kbd_row.pack(fill="x", pady=(4, 0))
+        tk.Label(kbd_row, text="Kbd:", font=FONT_TINY,
+                 fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w").pack(side="left")
+        self._kbd_btn = mac_button(kbd_row, "KBD: OFF", self._toggle_kbd, width=8)
+        self._kbd_btn.pack(side="left")
+        self._kb_info_var = tk.StringVar(value=f"Oct:{KB_DEFAULT_OCTAVE}  Vel:{KB_DEFAULT_VELOCITY}")
+        tk.Label(kbd_row, textvariable=self._kb_info_var,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left", padx=(6, 0))
+
         # Apply defaults
         self._on_gain(80)
         self._refresh_midi_ports()
+
+    # ------------------------------------------------------------------
+    # Keyboard piano input
+    # ------------------------------------------------------------------
+
+    def _setup_keyboard_input(self):
+        self.root.bind("<KeyPress>",     self._on_kb_press)
+        self.root.bind("<KeyRelease>",   self._on_kb_release)
+        self.root.bind_all("<Button-1>", self._refocus_root)
+        self.root.focus_set()
+
+    def _refocus_root(self, event):
+        self.root.after(1, self.root.focus_set)
+
+    def _toggle_kbd(self):
+        self._kb_active = not self._kb_active
+        self._kbd_btn.config(text="KBD: ON " if self._kb_active else "KBD: OFF")
+        if not self._kb_active:
+            self._release_all_kb_notes()
+
+    def _on_kb_press(self, event):
+        keysym = event.keysym.lower()
+
+        # M key always toggles regardless of active state
+        if keysym == "m":
+            self._toggle_kbd()
+            return
+
+        if not self._kb_active:
+            return
+
+        # Octave shift
+        if keysym == "z":
+            if self._kb_octave > 0:
+                self._release_all_kb_notes()
+                self._kb_octave -= 1
+                self._update_kb_display()
+            return
+        if keysym == "x":
+            if self._kb_octave < 7:
+                self._release_all_kb_notes()
+                self._kb_octave += 1
+                self._update_kb_display()
+            return
+
+        # Velocity
+        if keysym == "c":
+            self._kb_velocity = max(10, self._kb_velocity - KB_VELOCITY_STEP)
+            self._update_kb_display()
+            return
+        if keysym == "v":
+            self._kb_velocity = min(127, self._kb_velocity + KB_VELOCITY_STEP)
+            self._update_kb_display()
+            return
+
+        # Note on
+        if keysym in KB_NOTE_MAP and keysym not in self._kb_held:
+            self._kb_held.add(keysym)
+            midi = min(127, 12 * (self._kb_octave + 1) + KB_NOTE_MAP[keysym])
+            self.synth.note_on(midi, self._kb_velocity)
+
+    def _on_kb_release(self, event):
+        keysym = event.keysym.lower()
+        if keysym in self._kb_held:
+            self._kb_held.discard(keysym)
+            midi = min(127, 12 * (self._kb_octave + 1) + KB_NOTE_MAP[keysym])
+            self.synth.note_off(midi)
+
+    def _release_all_kb_notes(self):
+        for keysym in list(self._kb_held):
+            midi = min(127, 12 * (self._kb_octave + 1) + KB_NOTE_MAP[keysym])
+            self.synth.note_off(midi)
+        self._kb_held.clear()
+
+    def _update_kb_display(self):
+        self._kb_info_var.set(f"Oct:{self._kb_octave}  Vel:{self._kb_velocity}")
 
     def _on_gain(self, val):
         g = float(val) / 100.0
