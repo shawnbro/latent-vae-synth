@@ -21,6 +21,7 @@ import threading
 import dataclasses
 import json
 import tkinter as tk
+from tkinter import filedialog, messagebox
 import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
@@ -85,6 +86,7 @@ KB_VELOCITY_STEP    = 10
 CC_MAP_PATH        = os.path.expanduser("~/.latent_synth_cc.json")
 SETTINGS_PATH      = os.path.expanduser("~/.latent_synth_settings.json")
 LATENT_INDEX_PATH  = "export/latent_index.npz"
+PRESETS_DIR        = os.path.expanduser("~/Documents/LatentSynth/Presets")
 
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1057,9 @@ class SynthUI:
         for _ in range(3):
             tk.Frame(stripe2, bg=MAC_WHITE, height=1).pack(fill="x", pady=1)
 
+        # ── Menu bar ──────────────────────────────────────────────────
+        self._build_menubar(chrome)
+
         # Content area
         content = tk.Frame(chrome, bg=MAC_WHITE)
         content.pack(fill="both", expand=True, padx=1, pady=1)
@@ -1148,6 +1153,196 @@ class SynthUI:
         self._build_motion_panel(right_col)
         self._build_arpeggiator_panel(right_col)
         self._build_io_panel(right_col)
+
+    # ------------------------------------------------------------------
+    # Menu bar + presets
+    # ------------------------------------------------------------------
+
+    def _build_menubar(self, chrome):
+        bar = tk.Frame(chrome, bg=MAC_BG, bd=0)
+        bar.pack(fill="x")
+        tk.Frame(chrome, bg=MAC_SHADOW, height=1).pack(fill="x")
+
+        file_menu = tk.Menu(self.root, tearoff=0,
+                            bg=MAC_WHITE, fg=MAC_BLACK, font=FONT_SMALL,
+                            activebackground=MAC_BLACK, activeforeground=MAC_WHITE,
+                            bd=1, relief="solid")
+        file_menu.add_command(label="Save Preset…", command=self._save_preset)
+        file_menu.add_command(label="Load Preset…", command=self._load_preset)
+
+        def _show(event):
+            w = event.widget
+            file_menu.tk_popup(w.winfo_rootx(), w.winfo_rooty() + w.winfo_height())
+
+        file_btn = tk.Label(bar, text=" File ", font=FONT_SMALL,
+                            fg=MAC_BLACK, bg=MAC_BG, padx=4, pady=2,
+                            relief="flat", cursor="arrow")
+        file_btn.pack(side="left")
+        file_btn.bind("<Button-1>", _show)
+        file_btn.bind("<Enter>", lambda e: file_btn.config(bg=MAC_SHADOW))
+        file_btn.bind("<Leave>", lambda e: file_btn.config(bg=MAC_BG))
+
+    # ── Preset collect / apply ────────────────────────────────────────
+
+    def _collect_preset(self) -> dict:
+        steps = [
+            {"z0": float(self._arp_step_z0_sls[i].get()),
+             "z1": float(self._arp_step_z1_sls[i].get())}
+            for i in range(ARP_MAX_STEPS)
+        ]
+        return {
+            # latent position
+            "latent_x": self._latent_x,
+            "latent_y": self._latent_y,
+            # amplitude envelope
+            "atk": float(self._atk.get()),
+            "dec": float(self._dec.get()),
+            "sus": float(self._sus.get()),
+            "rel": float(self._rel.get()),
+            # filter
+            "cutoff":     float(self._cutoff_sl.get()),
+            "resonance":  float(self._res_sl.get()),
+            "env_amount": float(self._env_amt_sl.get()),
+            # filter envelope
+            "f_atk": float(self._fatk.get()),
+            "f_dec": float(self._fdec.get()),
+            "f_sus": float(self._fsus.get()),
+            "f_rel": float(self._frel.get()),
+            # motion
+            "lfo_active": self.lfo.active,
+            "lfo_shape":  self._lfo_shape_var.get(),
+            "lfo_rate":   float(self._lfo_rate_sl.get()),
+            "lfo_depth":  float(self._lfo_depth_sl.get()),
+            "glide":      float(self._glide_sl.get()),
+            "z0":         float(self._z0_sl.get()),
+            "z1":         float(self._z1_sl.get()),
+            # arpeggiator
+            "arp_enabled": self.synth._arp_enabled,
+            "arp_steps":   self.synth._arp_steps,
+            "arp_order":   self._arp_order_var.get(),
+            "arp_bpm":     float(self._arp_bpm_sl.get()),
+            "arp_gate":    float(self._arp_gate_sl.get()),
+            "arp_step_positions": steps,
+            # gain
+            "gain": float(self._gain_sl.get()),
+        }
+
+    def _apply_preset(self, d: dict):
+        """Set every control to the values in d, calling existing callbacks."""
+        g = d.get   # short alias
+
+        # Latent position
+        self._move_to_latent(float(g("latent_x", self._latent_x)),
+                             float(g("latent_y", self._latent_y)))
+
+        # Amplitude envelope
+        for sl, key in [(self._atk, "atk"), (self._dec, "dec"),
+                        (self._sus, "sus"), (self._rel, "rel")]:
+            if key in d:
+                sl.set(g(key))
+        self._apply_adsr()
+
+        # Filter main sliders
+        if "cutoff" in d:
+            self._cutoff_sl.set(g("cutoff"))
+            self._on_cutoff(g("cutoff"))
+        if "resonance" in d:
+            self._res_sl.set(g("resonance"))
+            self._on_resonance(g("resonance"))
+        if "env_amount" in d:
+            self._env_amt_sl.set(g("env_amount"))
+            self._on_env_amount(g("env_amount"))
+
+        # Filter envelope
+        for sl, key in [(self._fatk, "f_atk"), (self._fdec, "f_dec"),
+                        (self._fsus, "f_sus"), (self._frel, "f_rel")]:
+            if key in d:
+                sl.set(g(key))
+        self._apply_filter_adsr()
+
+        # Motion
+        if "lfo_shape" in d:
+            self._lfo_shape_var.set(g("lfo_shape"))
+            self._on_lfo_shape()
+        if "lfo_rate" in d:
+            self._lfo_rate_sl.set(g("lfo_rate"))
+            self._on_lfo_rate(g("lfo_rate"))
+        if "lfo_depth" in d:
+            self._lfo_depth_sl.set(g("lfo_depth"))
+            self._on_lfo_depth(g("lfo_depth"))
+        if "glide" in d:
+            self._glide_sl.set(g("glide"))
+            self._on_glide(g("glide"))
+        if "z0" in d:
+            self._z0_sl.set(g("z0"))
+        if "z1" in d:
+            self._z1_sl.set(g("z1"))
+
+        # LFO toggle — only change state if it differs
+        want_lfo = bool(g("lfo_active", self.lfo.active))
+        if want_lfo != self.lfo.active:
+            self._toggle_lfo()
+
+        # Arpeggiator
+        if "arp_order" in d:
+            self._arp_order_var.set(g("arp_order"))
+            self._on_arp_order()
+        if "arp_bpm" in d:
+            self._arp_bpm_sl.set(g("arp_bpm"))
+            self._on_arp_bpm(g("arp_bpm"))
+        if "arp_gate" in d:
+            self._arp_gate_sl.set(g("arp_gate"))
+            self._on_arp_gate(g("arp_gate"))
+        if "arp_steps" in d:
+            self._set_arp_steps(int(g("arp_steps")))
+        for i, pos in enumerate(g("arp_step_positions", [])):
+            if i < ARP_MAX_STEPS:
+                self._arp_step_z0_sls[i].set(pos.get("z0", 0.0))
+                self._arp_step_z1_sls[i].set(pos.get("z1", 0.0))
+                self._on_arp_step_latent(i)
+
+        want_arp = bool(g("arp_enabled", self.synth._arp_enabled))
+        if want_arp != self.synth._arp_enabled:
+            self._toggle_arp()
+
+        # Gain
+        if "gain" in d:
+            self._gain_sl.set(g("gain"))
+            self._on_gain(g("gain"))
+
+    # ── File dialog helpers ───────────────────────────────────────────
+
+    def _save_preset(self):
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            title="Save Preset",
+            initialdir=PRESETS_DIR,
+            defaultextension=".json",
+            filetypes=[("Preset files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(self._collect_preset(), f, indent=2)
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _load_preset(self):
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        path = filedialog.askopenfilename(
+            title="Load Preset",
+            initialdir=PRESETS_DIR,
+            filetypes=[("Preset files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            self._apply_preset(d)
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            messagebox.showerror("Load failed", str(e))
 
     # ------------------------------------------------------------------
     # Collapsible panel helper
