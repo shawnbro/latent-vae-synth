@@ -33,12 +33,13 @@ AKWF waveforms  →  VAE encoder  →  2D latent space  →  VAE decoder  →  w
 
 Classic Macintosh-inspired interface built with tkinter:
 
-- **XY Pad** — drag to navigate the latent space; displays current z₀/z₁ coordinates
-- **Oscillator** — live waveform display updates as you move
-- **Envelope** — ADSR amplitude envelope with log-scale sliders
+- **XY Pad** — drag to navigate the latent space; shows z₀/z₁ coordinates and the name of the nearest AKWF waveform
+- **Oscilloscope** — live audio display with zero-crossing trigger; shows decoded waveform shape when silent
+- **Envelope** — ADSR amplitude envelope with log-scale sliders (1 ms – 8000 ms)
 - **Filter** — resonant lowpass with envelope modulation amount
-- **Motion** — LFO with four shapes, Z0/Z1 scan sliders, and a Randomize button
-- **I/O** — master gain, MIDI input selector, audio output selector
+- **Motion** — LFO with four shapes, Z0/Z1 scan sliders, glide, and a Randomize button
+- **Arpeggiator** — step arpeggiator (1–4 steps) with per-step latent positions, BPM/gate control, and up/down/up-down/random order
+- **I/O** — master gain, MIDI input selector, audio output selector, keyboard piano toggle
 
 ### Motion panel
 
@@ -50,8 +51,35 @@ Classic Macintosh-inspired interface built with tkinter:
 | **Walk** | Ornstein-Uhlenbeck random walk (mean-reverts to center) |
 | **Rate** | 0.05 – 4 Hz |
 | **Depth** | Radius/amplitude in latent units (0 – 4) |
+| **Glide** | Portamento time (0 – 1000 ms) |
 | **Z0 / Z1** | Direct axis control; sets LFO center when LFO is on |
 | **Randomize** | Single-click = nearby jump (r ≤ 1.5); double-click = anywhere |
+
+### Keyboard piano
+
+Press **M** to toggle. When on:
+
+| Key | Action |
+|-----|--------|
+| `A W S E D F T G Y H U J K O L` | Piano keys (white + black), one octave |
+| `Z` / `X` | Octave down / up |
+| `C` / `V` | Velocity −10 / +10 |
+
+### MIDI CC Learn
+
+Every controllable parameter has a **CC** button. Click it (turns yellow), wiggle a hardware knob — the button shows the bound CC number and flashes green. Click again to cancel. **CLEAR CC** in the I/O panel removes all assignments.
+
+Assignable parameters: Latent X, Latent Y, Z0, Z1, Gain, Cutoff, Resonance, Env Amount, Attack, Decay, Sustain, Release, Glide, LFO Rate, LFO Depth.
+
+CC assignments persist to `~/.latent_synth_cc.json` and are restored on next launch.
+
+### Waveform name
+
+Below the oscilloscope, the synth shows the nearest AKWF waveform to the current latent position (e.g. *Akai MPC / AKWF_1725*, *Synthesis Technology / AKWF_eorgan_0018*). This requires `export/latent_index.npz` — see build instructions below. Without it, a spectral descriptor is shown instead (*Warm · Rich*, etc.).
+
+### Settings persistence
+
+The selected MIDI input port is saved to `~/.latent_synth_settings.json` and restored on next launch.
 
 ---
 
@@ -70,7 +98,7 @@ python app/synth.py
 
 The repo includes a pre-trained ONNX decoder (`export/decoder.onnx` + `export/decoder.onnx.data`), so you can run the synth immediately without training.
 
-**MIDI:** Connect a MIDI controller and select it from the MIDI In dropdown. The synth responds to note-on/off velocity. Audio routes to whatever device you select in Audio Out — use a virtual cable (e.g. [BlackHole](https://existential.audio/blackhole/)) to send it into a DAW.
+**MIDI:** Connect a MIDI controller and select it from the MIDI In dropdown. The synth responds to note-on/off velocity and any CC assignments you configure. Audio routes to whatever device you select in Audio Out — use a virtual cable (e.g. [BlackHole](https://existential.audio/blackhole/)) to send it into a DAW.
 
 ---
 
@@ -119,7 +147,15 @@ python export/export.py --checkpoint model/checkpoints/best.pt
 
 Validates the ONNX output against PyTorch and benchmarks inference latency. Target: < 1 ms per waveform.
 
-### 5. Run the synth
+### 5. Build the latent index
+
+```bash
+python export/build_latent_index.py
+```
+
+Encodes all waveforms through the trained VAE encoder and saves their 2D coordinates to `export/latent_index.npz`. The synth uses this for nearest-neighbour waveform name lookup. Re-run after retraining.
+
+### 6. Run the synth
 
 ```bash
 python app/synth.py --model export/decoder.onnx
@@ -164,6 +200,7 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 - Phase increment: `WAVEFORM_LEN × freq / SAMPLE_RATE`
 - Linear interpolation between samples for alias-free playback
 - 512-sample blocks at 44100 Hz → ~11.6 ms latency
+- Up to 8 voices with square-root gain scaling
 
 ---
 
@@ -172,13 +209,15 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 ```
 .
 ├── app/
-│   └── synth.py              # Standalone synth app
+│   └── synth.py              # Standalone synth app (engine + UI)
 ├── data/
 │   └── akwf/                 # AKWF dataset (not in repo — see above)
 ├── export/
 │   ├── export.py             # ONNX export script
+│   ├── build_latent_index.py # Build waveform name lookup index
 │   ├── decoder.onnx          # Exported model graph
-│   └── decoder.onnx.data     # Model weights (1.3 MB)
+│   ├── decoder.onnx.data     # Model weights (1.3 MB)
+│   └── latent_index.npz      # Latent coords for 45K waveforms (build once)
 ├── model/
 │   ├── vae.py                # VAE architecture
 │   ├── dataset.py            # AKWF dataset loader + cache
@@ -202,7 +241,7 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 - onnx / onnxruntime / onnxscript
 - sounddevice (audio output)
 - pygame (MIDI input via PortMidi — avoids Python 3.13 GIL issues with rtmidi)
-- scipy (biquad filter)
+- scipy (biquad filter + KDTree for waveform name lookup)
 - matplotlib (visualization only)
 
 ---
@@ -221,9 +260,8 @@ Ideas for where to take this next, roughly in order of effort:
 - Tempo-sync the LFO rate to MIDI clock
 
 **Synth features**
-- Polyphony (voice pool with per-voice phase/envelope state)
-- MIDI CC mapping for envelope, filter, and gain parameters
 - Preset save/load — serialize named latent positions to JSON
+- MIDI program change to step through stored presets
 
 **Distribution**
 - Package as a VST3/AU plugin via [JUCE](https://juce.com/) or [iPlug2](https://iplug2.github.io/) with the ONNX runtime embedded

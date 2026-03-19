@@ -19,11 +19,13 @@ import os
 import argparse
 import threading
 import dataclasses
+import json
 import tkinter as tk
 import numpy as np
 import sounddevice as sd
 import onnxruntime as ort
 from scipy.signal import lfilter
+from scipy.spatial import KDTree
 
 try:
     import pygame
@@ -79,6 +81,24 @@ KB_NOTE_MAP: dict[str, int] = {
 KB_DEFAULT_OCTAVE   = 4
 KB_DEFAULT_VELOCITY = 100
 KB_VELOCITY_STEP    = 10
+
+CC_MAP_PATH        = os.path.expanduser("~/.latent_synth_cc.json")
+SETTINGS_PATH      = os.path.expanduser("~/.latent_synth_settings.json")
+LATENT_INDEX_PATH  = "export/latent_index.npz"
+
+
+# ---------------------------------------------------------------------------
+# CC Mapping
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class CCMapping:
+    """Binds a MIDI CC number to a synth parameter."""
+    key:     str     # registry key, e.g. "latent_x"
+    label:   str     # display name
+    min_val: float
+    max_val: float
+    setter:  object  # callable(float) — must be thread-safe (uses root.after)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +515,11 @@ class LatentSynth:
         self._base_cutoff  = 18000.0
         self._env_amount   = 0.0
 
+        # Oscilloscope ring buffer — written by audio callback, read by UI
+        _OSC_LEN        = 4096
+        self._osc_buf   = np.zeros(_OSC_LEN, dtype=np.float32)
+        self._osc_pos   = 0    # write head
+
         self.set_latent(0.0, 0.0)
 
         # Arpeggiator
@@ -695,7 +720,31 @@ class LatentSynth:
         if n_active > 0:
             mix *= self._gain / (n_active ** 0.5)
 
+        # Feed oscilloscope ring buffer
+        buf_len = len(self._osc_buf)
+        pos     = self._osc_pos
+        end     = pos + frames
+        if end <= buf_len:
+            self._osc_buf[pos:end] = mix
+        else:
+            cut = buf_len - pos
+            self._osc_buf[pos:]  = mix[:cut]
+            self._osc_buf[:frames - cut] = mix[cut:]
+        self._osc_pos = end % buf_len
+
         outdata[:, 0] = mix
+
+    def get_oscilloscope_data(self, n_display: int = 1024) -> np.ndarray:
+        """Return a zero-crossing-triggered window of recent audio output."""
+        pos = self._osc_pos
+        # Linearise ring buffer: oldest sample first
+        buf = np.concatenate([self._osc_buf[pos:], self._osc_buf[:pos]])
+        # Search for a rising zero crossing in the second half
+        search_start = max(0, len(buf) - 2 * n_display)
+        for i in range(search_start, len(buf) - n_display):
+            if buf[i] <= 0.0 < buf[i + 1]:
+                return buf[i:i + n_display]
+        return buf[-n_display:]
 
     # ------------------------------------------------------------------
     # Audio stream management
@@ -729,10 +778,12 @@ class MidiInput:
     """
 
     def __init__(self, synth: LatentSynth):
-        self.synth   = synth
-        self._input  = None
-        self._active = False
-        self._thread = None
+        self.synth             = synth
+        self._input            = None
+        self._active           = False
+        self._thread           = None
+        self.cc_map: dict      = {}    # {cc_num (int): CCMapping}
+        self._learn_callback   = None  # callable(cc_num) during MIDI learn, else None
 
     def list_ports(self):
         if not MIDI_AVAILABLE:
@@ -769,9 +820,22 @@ class MidiInput:
                             self.synth.note_on(note, vel)
                         elif status == 0x80 or (status == 0x90 and vel == 0):
                             self.synth.note_off(note)
+                        elif status == 0xB0:
+                            self._handle_cc(data[1], data[2])
             except Exception:
                 break
             threading.Event().wait(0.001)
+
+    def _handle_cc(self, cc_num: int, cc_val: int):
+        """Dispatch a CC event: complete a learn, or apply a mapped value."""
+        if self._learn_callback is not None:
+            cb, self._learn_callback = self._learn_callback, None
+            cb(cc_num)
+            return
+        m = self.cc_map.get(cc_num)
+        if m:
+            scaled = m.min_val + (cc_val / 127.0) * (m.max_val - m.min_val)
+            m.setter(scaled)
 
     def close(self):
         self._active = False
@@ -925,6 +989,9 @@ class SynthUI:
         self._kb_velocity = KB_DEFAULT_VELOCITY
         self._kb_held     = set()   # held keysyms — prevents OS key-repeat flood
 
+        self._learn_target: dict | None = None  # {'key': str, 'btn': tk.Button}
+        self._cc_buttons:   dict        = {}    # {key: tk.Button}
+
         # LFO: callback fires on main thread via root.after
         self.lfo = LatentLFO(
             lambda x, y: self.root.after(0, self._lfo_update, x, y)
@@ -933,6 +1000,13 @@ class SynthUI:
         self._build_ui()
         self._update_waveform_display(synth._waveform_to)
         self._setup_keyboard_input()
+        self._load_cc_map()
+        self._load_settings()
+        self._wave_tree      = None
+        self._wave_filenames = None
+        self._try_load_latent_index()
+        self._update_wave_name(synth._waveform_to)
+        self._osc_timer()
 
         # Wire arp step highlight callback (after _build_ui creates the labels)
         self.synth.arp._step_callback = lambda i: self.root.after(
@@ -1028,6 +1102,18 @@ class SynthUI:
                  relief="sunken", bd=1, padx=4, anchor="w").pack(
                      fill="x", pady=(3, 0))
 
+        # CC learn buttons for latent X / Y
+        cc_row = tk.Frame(left_col, bg=MAC_WHITE)
+        cc_row.pack(fill="x", pady=(2, 0))
+        for _key, _lbl in [("latent_x", "CC X"), ("latent_y", "CC Y")]:
+            _btn = tk.Button(cc_row, text=_lbl, font=FONT_TINY,
+                             fg=MAC_BLACK, bg=MAC_BG,
+                             relief="raised", bd=2, width=5,
+                             activebackground=MAC_HILIGHT)
+            _btn.config(command=lambda k=_key, b=_btn: self._start_learn(k, b))
+            _btn.pack(side="left", padx=(0, 2))
+            self._cc_buttons[_key] = _btn
+
         # ── Waveform display ──────────────────────────────────────────
         tk.Label(left_col, text="◆ Oscillator",
                  font=("Monaco", 9, "bold"),
@@ -1041,6 +1127,11 @@ class SynthUI:
             bg=MAC_WHITE, highlightthickness=0,
         )
         self.wave_canvas.pack()
+
+        self._wave_name_var = tk.StringVar(value="")
+        tk.Label(left_col, textvariable=self._wave_name_var,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_WHITE,
+                 anchor="w").pack(fill="x", pady=(1, 0))
 
         # ── Right column panels ───────────────────────────────────────
         self._build_envelope_panel(right_col)
@@ -1068,7 +1159,7 @@ class SynthUI:
         tk.Label(panel, textvariable=self._env_readout,
                  font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG).pack(pady=(0, 4))
 
-        def make_adsr_slider(col, label, from_, to, init, cmd):
+        def make_adsr_slider(col, label, from_, to, init, cmd, cc_key=None):
             f = tk.Frame(sliders_row, bg=MAC_BG)
             f.grid(row=0, column=col, padx=6)
             s = mac_slider(f, from_=from_, to=to, command=cmd, length=100)
@@ -1076,21 +1167,33 @@ class SynthUI:
             s.pack()
             tk.Label(f, text=label, font=("Monaco", 9, "bold"),
                      fg=MAC_BLACK, bg=MAC_BG).pack()
+            if cc_key:
+                btn = tk.Button(f, text="CC", font=FONT_TINY,
+                                fg=MAC_BLACK, bg=MAC_BG,
+                                relief="raised", bd=2, width=3,
+                                activebackground=MAC_HILIGHT)
+                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
+                btn.pack()
+                self._cc_buttons[cc_key] = btn
             return s
 
         self._atk = make_adsr_slider(0, "A", 100, 0, 30,
-                                      lambda v: self._on_adsr("A", v))
+                                      lambda v: self._on_adsr("A", v),
+                                      cc_key="attack")
         self._dec = make_adsr_slider(1, "D", 100, 0, 55,
-                                      lambda v: self._on_adsr("D", v))
+                                      lambda v: self._on_adsr("D", v),
+                                      cc_key="decay")
         self._sus = make_adsr_slider(2, "S", 100, 0, 70,
-                                      lambda v: self._on_adsr("S", v))
+                                      lambda v: self._on_adsr("S", v),
+                                      cc_key="sustain")
         self._rel = make_adsr_slider(3, "R", 100, 0, 60,
-                                      lambda v: self._on_adsr("R", v))
+                                      lambda v: self._on_adsr("R", v),
+                                      cc_key="release")
 
         self._apply_adsr()
 
     def _log_time(self, slider_val):
-        return 1.0 * (2000.0 ** (float(slider_val) / 100.0))
+        return 1.0 * (8000.0 ** (float(slider_val) / 100.0))
 
     def _on_adsr(self, param, val):
         self._apply_adsr()
@@ -1126,7 +1229,7 @@ class SynthUI:
         inner = tk.Frame(panel, bg=MAC_BG)
         inner.pack(padx=8, pady=(0, 6), fill="x")
 
-        def make_row(label, from_, to, init, cmd):
+        def make_row(label, from_, to, init, cmd, cc_key=None):
             row = tk.Frame(inner, bg=MAC_BG)
             row.pack(fill="x", pady=2)
             tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
@@ -1138,14 +1241,22 @@ class SynthUI:
             val_lbl = tk.Label(row, text="", font=FONT_TINY,
                                 fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
             val_lbl.pack(side="left", padx=(4, 0))
+            if cc_key:
+                btn = tk.Button(row, text="CC", font=FONT_TINY,
+                                fg=MAC_BLACK, bg=MAC_BG,
+                                relief="raised", bd=2, width=3,
+                                activebackground=MAC_HILIGHT)
+                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
+                btn.pack(side="left", padx=(2, 0))
+                self._cc_buttons[cc_key] = btn
             return s, val_lbl
 
         self._cutoff_sl, self._cutoff_lbl = make_row(
-            "Cutoff:", 0, 100, 85, self._on_cutoff)
+            "Cutoff:", 0, 100, 85, self._on_cutoff, cc_key="cutoff")
         self._res_sl, self._res_lbl = make_row(
-            "Resonance:", 0, 100, 0, self._on_resonance)
+            "Resonance:", 0, 100, 0, self._on_resonance, cc_key="resonance")
         self._env_amt_sl, self._env_amt_lbl = make_row(
-            "Env Amount:", 0, 100, 0, self._on_env_amount)
+            "Env Amount:", 0, 100, 0, self._on_env_amount, cc_key="env_amount")
 
         self._on_cutoff(self._cutoff_sl.get())
         self._on_resonance(self._res_sl.get())
@@ -1212,7 +1323,7 @@ class SynthUI:
             ).pack(side="left", padx=1)
 
         # Rate / Depth / Z0 / Z1 sliders
-        def make_row(label, from_, to, init, cmd, res=0):
+        def make_row(label, from_, to, init, cmd, res=0, cc_key=None):
             row = tk.Frame(inner, bg=MAC_BG)
             row.pack(fill="x", pady=1)
             tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
@@ -1224,18 +1335,28 @@ class SynthUI:
             lbl = tk.Label(row, text="", font=FONT_TINY,
                             fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
             lbl.pack(side="left", padx=(3, 0))
+            if cc_key:
+                btn = tk.Button(row, text="CC", font=FONT_TINY,
+                                fg=MAC_BLACK, bg=MAC_BG,
+                                relief="raised", bd=2, width=3,
+                                activebackground=MAC_HILIGHT)
+                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
+                btn.pack(side="left", padx=(2, 0))
+                self._cc_buttons[cc_key] = btn
             return s, lbl
 
         self._lfo_rate_sl,  self._lfo_rate_lbl  = make_row(
-            "Rate:",  1, 100, 20, self._on_lfo_rate)
+            "Rate:",  1, 100, 20, self._on_lfo_rate, cc_key="lfo_rate")
         self._lfo_depth_sl, self._lfo_depth_lbl = make_row(
-            "Depth:", 0, 100, 50, self._on_lfo_depth)
+            "Depth:", 0, 100, 50, self._on_lfo_depth, cc_key="lfo_depth")
         self._glide_sl, self._glide_lbl = make_row(
-            "Glide:", 0, 1000, 0, self._on_glide)
+            "Glide:", 0, 1000, 0, self._on_glide, cc_key="glide")
         self._z0_sl, self._z0_lbl = make_row(
-            "Z0:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z0_scan, res=0.01)
+            "Z0:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z0_scan, res=0.01,
+            cc_key="z0")
         self._z1_sl, self._z1_lbl = make_row(
-            "Z1:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z1_scan, res=0.01)
+            "Z1:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z1_scan, res=0.01,
+            cc_key="z1")
 
         # Randomize button
         rand_row = tk.Frame(inner, bg=MAC_BG)
@@ -1555,6 +1676,14 @@ class SynthUI:
         self._gain_lbl = tk.Label(gain_row, text="80%", font=FONT_TINY,
                                    fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
         self._gain_lbl.pack(side="left", padx=(4, 0))
+        _gain_cc_btn = tk.Button(gain_row, text="CC", font=FONT_TINY,
+                                  fg=MAC_BLACK, bg=MAC_BG,
+                                  relief="raised", bd=2, width=3,
+                                  activebackground=MAC_HILIGHT)
+        _gain_cc_btn.config(
+            command=lambda b=_gain_cc_btn: self._start_learn("gain", b))
+        _gain_cc_btn.pack(side="left", padx=(2, 0))
+        self._cc_buttons["gain"] = _gain_cc_btn
 
         # MIDI
         midi_row = tk.Frame(inner, bg=MAC_BG)
@@ -1606,6 +1735,13 @@ class SynthUI:
         self._kb_info_var = tk.StringVar(value=f"Oct:{KB_DEFAULT_OCTAVE}  Vel:{KB_DEFAULT_VELOCITY}")
         tk.Label(kbd_row, textvariable=self._kb_info_var,
                  font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left", padx=(6, 0))
+
+        # CC clear row
+        cc_clear_row = tk.Frame(inner, bg=MAC_BG)
+        cc_clear_row.pack(fill="x", pady=(6, 0))
+        mac_button(cc_clear_row, "CLEAR CC", self._clear_cc_map).pack(side="left")
+        tk.Label(cc_clear_row, text=" clears all MIDI CC assignments",
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left")
 
         # Apply defaults
         self._on_gain(80)
@@ -1767,27 +1903,107 @@ class SynthUI:
         # Decode inline — 0.26 ms, safe on main thread
         waveform = self.synth.set_latent(x, y)
 
-        # Update waveform display at 1/5 rate (10 Hz is plenty for visual)
+        # Update waveform name at 1/5 rate (10 Hz is plenty for visual)
         if self._lfo_tick % 5 == 0:
-            self._update_waveform_display(waveform)
+            self._update_wave_name(waveform)
 
     def _decode_and_update(self, x, y):
         waveform = self.synth.set_latent(x, y)
-        self.root.after(0, self._update_waveform_display, waveform)
+        self.root.after(0, self._update_wave_name, waveform)
 
     # ------------------------------------------------------------------
-    # Waveform display
+    # Waveform display / oscilloscope
     # ------------------------------------------------------------------
 
-    def _update_waveform_display(self, waveform: np.ndarray):
+    def _osc_timer(self):
+        """30 Hz timer: oscilloscope when audio is live, decoded wave otherwise."""
+        data = self.synth.get_oscilloscope_data()
+        rms  = float(np.sqrt(np.mean(data ** 2)))
+        if rms > 0.001:
+            self._update_waveform_display(data, auto_scale=True)
+        else:
+            self._update_waveform_display(self.synth._waveform_to)
+        self.root.after(33, self._osc_timer)
+
+    def _waveform_descriptor(self, waveform: np.ndarray) -> str:
+        """Two-word spectral descriptor for the decoded waveform."""
+        fft = np.abs(np.fft.rfft(waveform))
+        fft[0] = 0.0  # strip DC
+        total = fft.sum()
+        if total < 1e-6:
+            return ""
+        freqs    = np.arange(len(fft), dtype=np.float32)
+        centroid = float((freqs * fft).sum() / total)
+        brightness = centroid / len(fft)  # 0–1
+
+        fund  = fft[1] if len(fft) > 1 else 0.0
+        richness = 1.0 - fund / total  # 0 = pure sine, 1 = no fundamental
+
+        b = ("Dark" if brightness < 0.08
+             else "Warm" if brightness < 0.22
+             else "Mid"  if brightness < 0.40
+             else "Bright")
+        r = ("Pure"    if richness < 0.15
+             else "Mild"    if richness < 0.40
+             else "Rich"    if richness < 0.70
+             else "Complex")
+        return f"{b} · {r}"
+
+    def _try_load_latent_index(self):
+        if not os.path.exists(LATENT_INDEX_PATH):
+            return
+        try:
+            data = np.load(LATENT_INDEX_PATH, allow_pickle=True)
+            self._wave_tree      = KDTree(data["mus"])
+            self._wave_filenames = data["filenames"].tolist()
+            print(f"Latent index: {len(self._wave_filenames):,} waveforms")
+        except Exception as e:
+            print(f"Latent index load error: {e}")
+
+    @staticmethod
+    def _format_wave_label(filename: str) -> str:
+        """
+        'AKWF--Akai-MPC/AKWF_0001/AKWF_0001.WAV'     → 'Akai MPC / AKWF_0001'
+        'AKWF--SonicWare--Smpltrek/…/AKWF_1939.wav'  → 'SonicWare · Smpltrek / AKWF_1939'
+        'AKWF_clavinet_0001.WAV'                       → 'AKWF_clavinet_0001'
+        """
+        parts = filename.replace("\\", "/").split("/")
+        stem  = os.path.splitext(parts[-1])[0]
+        if len(parts) >= 2:
+            cat = parts[0]
+            if cat.upper().startswith("AKWF--"):
+                # strip prefix; replace inner '--' with ' · ' before '-' → ' '
+                cat = cat[6:].replace("--", " · ").replace("-", " ")
+            elif cat.upper().startswith("AKWF_"):
+                cat = cat[5:].replace("_", " ").title()
+            return f"{cat} / {stem}"
+        return stem
+
+    def _update_wave_name(self, waveform: np.ndarray):
+        if self._wave_tree is not None:
+            _, idx = self._wave_tree.query([self._latent_x, self._latent_y])
+            name = self._format_wave_label(self._wave_filenames[idx])
+        else:
+            name = self._waveform_descriptor(waveform)
+        self._wave_name_var.set(name)
+
+    def _update_waveform_display(self, waveform: np.ndarray, auto_scale: bool = False):
         w, h   = WAVE_WIDTH, WAVE_HEIGHT
         margin = 6
         n      = len(waveform)
         step   = n / (w - 2 * margin)
 
+        # For oscilloscope: normalise to peak so quiet signals still fill the view
+        if auto_scale:
+            peak = float(np.max(np.abs(waveform)))
+            scale = 1.0 / peak if peak > 1e-4 else 1.0
+        else:
+            scale = 1.0
+
         points = []
         for px in range(w - 2 * margin):
-            val = waveform[int(px * step) % n]
+            val = float(waveform[int(px * step) % n]) * scale
+            val = max(-1.0, min(1.0, val))
             py  = margin + (1.0 - val) / 2.0 * (h - 2 * margin)
             points.extend([px + margin, py])
 
@@ -1802,22 +2018,215 @@ class SynthUI:
     # MIDI
     # ------------------------------------------------------------------
 
-    def _refresh_midi_ports(self):
+    def _refresh_midi_ports(self, preferred_name: str | None = None):
         ports = self.midi.list_ports()
         menu  = self._midi_menu["menu"]
         menu.delete(0, "end")
         if ports:
-            dev_id, name = ports[0]
-            self._midi_var.set(name)
             for dev_id, name in ports:
                 menu.add_command(
                     label=name,
-                    command=lambda d=dev_id, n=name: (
-                        self._midi_var.set(n), self.midi.open_port(d)))
-            self.midi.open_port(ports[0][0])
+                    command=lambda d=dev_id, n=name: self._select_midi_port(d, n))
+            # Pick the preferred port if available, otherwise the first one
+            match = next(((d, n) for d, n in ports if n == preferred_name), None)
+            dev_id, name = match if match else ports[0]
+            self._select_midi_port(dev_id, name, save=False)
         else:
             self._midi_var.set("(no ports)")
             menu.add_command(label="(no ports)", command=lambda: None)
+
+    def _select_midi_port(self, dev_id: int, name: str, save: bool = True):
+        """Open a MIDI port and optionally persist the choice."""
+        self._midi_var.set(name)
+        self.midi.open_port(dev_id)
+        if save:
+            self._save_settings()
+
+    # ------------------------------------------------------------------
+    # MIDI Learn
+    # ------------------------------------------------------------------
+
+    def _start_learn(self, key: str, btn: tk.Button):
+        """Begin or cancel MIDI learn for the given parameter key."""
+        # Cancel if same button clicked while already learning
+        if (self._learn_target is not None
+                and self._learn_target["key"] == key):
+            self.midi._learn_callback = None
+            prev_text = self._learn_target.get("prev_text", "CC")
+            self._learn_target = None
+            btn.config(bg=MAC_BG, text=prev_text)
+            return
+
+        # Cancel any previous learn
+        if self._learn_target is not None:
+            old_btn  = self._learn_target["btn"]
+            old_text = self._learn_target.get("prev_text", "CC")
+            old_btn.config(bg=MAC_BG, text=old_text)
+            self.midi._learn_callback = None
+
+        prev_text = btn.cget("text")
+        self._learn_target = {"key": key, "btn": btn, "prev_text": prev_text}
+        btn.config(bg="#ffff99", text="...")
+        self.midi._learn_callback = lambda cc: self.root.after(
+            0, self._finish_learn, cc)
+
+    def _finish_learn(self, cc_num: int):
+        """Bind cc_num to the pending learn target and update UI."""
+        if self._learn_target is None:
+            return
+
+        key = self._learn_target["key"]
+        btn = self._learn_target["btn"]
+        self._learn_target = None
+
+        # Remove any prior binding for this CC number
+        self.midi.cc_map.pop(cc_num, None)
+
+        mapping = self._make_cc_mapping(key)
+        if mapping is None:
+            btn.config(bg=MAC_BG, text="CC")
+            return
+
+        self.midi.cc_map[cc_num] = mapping
+        btn.config(bg=MAC_BG, text=str(cc_num))
+
+        # Brief green flash to confirm
+        btn.config(bg="#99ff99")
+        self.root.after(400, lambda: btn.config(bg=MAC_BG))
+
+        self._save_cc_map()
+
+    def _make_cc_mapping(self, key: str):
+        """Build a CCMapping for the given registry key, or None if unknown."""
+        root = self.root
+        defs = {
+            "latent_x": (
+                "Latent X", LATENT_MIN, LATENT_MAX,
+                lambda v: root.after(
+                    0, lambda: self._move_to_latent(v, self._latent_y)),
+            ),
+            "latent_y": (
+                "Latent Y", LATENT_MIN, LATENT_MAX,
+                lambda v: root.after(
+                    0, lambda: self._move_to_latent(self._latent_x, v)),
+            ),
+            "gain": (
+                "Gain", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._gain_sl.set(v), self._on_gain(v))),
+            ),
+            "cutoff": (
+                "Cutoff", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._cutoff_sl.set(v), self._on_cutoff(v))),
+            ),
+            "resonance": (
+                "Resonance", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._res_sl.set(v), self._on_resonance(v))),
+            ),
+            "env_amount": (
+                "Env Amt", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._env_amt_sl.set(v), self._on_env_amount(v))),
+            ),
+            "attack": (
+                "Attack", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._atk.set(v), self._apply_adsr())),
+            ),
+            "decay": (
+                "Decay", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._dec.set(v), self._apply_adsr())),
+            ),
+            "sustain": (
+                "Sustain", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._sus.set(v), self._apply_adsr())),
+            ),
+            "release": (
+                "Release", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._rel.set(v), self._apply_adsr())),
+            ),
+            "glide": (
+                "Glide", 0, 1000,
+                lambda v: root.after(
+                    0, lambda: (self._glide_sl.set(v), self._on_glide(v))),
+            ),
+            "lfo_rate": (
+                "LFO Rate", 1, 100,
+                lambda v: root.after(
+                    0, lambda: (self._lfo_rate_sl.set(v), self._on_lfo_rate(v))),
+            ),
+            "lfo_depth": (
+                "LFO Depth", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._lfo_depth_sl.set(v), self._on_lfo_depth(v))),
+            ),
+            "z0": (
+                "Z0", LATENT_MIN, LATENT_MAX,
+                lambda v: root.after(
+                    0, lambda: (self._z0_sl.set(v), self._on_z0_scan(v))),
+            ),
+            "z1": (
+                "Z1", LATENT_MIN, LATENT_MAX,
+                lambda v: root.after(
+                    0, lambda: (self._z1_sl.set(v), self._on_z1_scan(v))),
+            ),
+        }
+        if key not in defs:
+            return None
+        label, min_val, max_val, setter = defs[key]
+        return CCMapping(key=key, label=label,
+                         min_val=min_val, max_val=max_val, setter=setter)
+
+    def _clear_cc_map(self):
+        """Remove all CC assignments and reset button labels."""
+        self.midi.cc_map.clear()
+        self.midi._learn_callback = None
+        self._learn_target = None
+        for key, btn in self._cc_buttons.items():
+            btn.config(bg=MAC_BG, text="CC" if key not in ("latent_x", "latent_y")
+                       else ("CC X" if key == "latent_x" else "CC Y"))
+        self._save_cc_map()
+
+    # ------------------------------------------------------------------
+    # CC persistence
+    # ------------------------------------------------------------------
+
+    def _save_cc_map(self):
+        """Write CC assignments to disk as {cc_num_str: key}."""
+        data = {str(cc): m.key for cc, m in self.midi.cc_map.items()}
+        try:
+            with open(CC_MAP_PATH, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"CC map save error: {e}")
+
+    def _load_cc_map(self):
+        """Restore CC assignments from disk and update button labels."""
+        if not os.path.exists(CC_MAP_PATH):
+            return
+        try:
+            with open(CC_MAP_PATH) as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"CC map load error: {e}")
+            return
+        for cc_str, key in data.items():
+            try:
+                cc_num = int(cc_str)
+            except ValueError:
+                continue
+            mapping = self._make_cc_mapping(key)
+            if mapping is None:
+                continue
+            self.midi.cc_map[cc_num] = mapping
+            btn = self._cc_buttons.get(key)
+            if btn:
+                btn.config(text=str(cc_num))
 
     # ------------------------------------------------------------------
     # Audio
@@ -1829,6 +2238,31 @@ class SynthUI:
         self.synth.start_audio(device=device_idx)
 
     # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+
+    def _save_settings(self):
+        data = {"midi_port": self._midi_var.get()}
+        try:
+            with open(SETTINGS_PATH, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Settings save error: {e}")
+
+    def _load_settings(self):
+        if not os.path.exists(SETTINGS_PATH):
+            return
+        try:
+            with open(SETTINGS_PATH) as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"Settings load error: {e}")
+            return
+        saved_port = data.get("midi_port")
+        if saved_port:
+            self._refresh_midi_ports(preferred_name=saved_port)
+
+    # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
@@ -1837,6 +2271,8 @@ class SynthUI:
         self.root.mainloop()
 
     def _on_close(self):
+        self._save_cc_map()
+        self._save_settings()
         self.lfo.stop()
         self.synth.arp.stop()
         self.synth.stop_audio()
