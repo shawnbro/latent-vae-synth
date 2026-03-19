@@ -47,9 +47,9 @@ WAVEFORM_LEN = 2048
 LATENT_MIN   = -4.0
 LATENT_MAX   =  4.0
 MAX_VOICES   = 8
-PAD_SIZE     = 360
-WAVE_WIDTH   = 360
-WAVE_HEIGHT  = 90
+PAD_SIZE     = 300
+WAVE_WIDTH   = 300
+WAVE_HEIGHT  = 60
 
 # Mac Classic palette
 MAC_BG      = "#c0c0c0"
@@ -440,12 +440,13 @@ class Arpeggiator:
 
 class Voice:
     def __init__(self):
-        self.midi_note  = None
-        self._phase     = 0.0
-        self._frequency = 0.0
-        self._velocity  = 0.0
-        self.envelope   = ADSREnvelope(SAMPLE_RATE)
-        self.filt       = BiquadFilter(SAMPLE_RATE)
+        self.midi_note      = None
+        self._phase         = 0.0
+        self._frequency     = 0.0
+        self._velocity      = 0.0
+        self.envelope       = ADSREnvelope(SAMPLE_RATE)
+        self.filter_envelope = ADSREnvelope(SAMPLE_RATE)
+        self.filt           = BiquadFilter(SAMPLE_RATE)
         self._own_waveform: np.ndarray | None = None
 
     @property
@@ -463,9 +464,11 @@ class Voice:
         if self.envelope.state == ADSREnvelope.IDLE:
             self.filt.reset()   # clear stale filter state on fresh starts only
         self.envelope.note_on()
+        self.filter_envelope.note_on()
 
     def note_off(self):
         self.envelope.note_off()
+        self.filter_envelope.note_off()
         self.midi_note = None
 
     def render(self, frames: int, waveform: np.ndarray,
@@ -484,11 +487,12 @@ class Voice:
         samples   = wf[idx] * (1.0 - frac) + wf[next_idx] * frac
         self._phase = (self._phase + frames * phase_inc) % WAVEFORM_LEN
 
-        env = self.envelope.process(frames)
+        env      = self.envelope.process(frames)
+        filt_env = self.filter_envelope.process(frames)
 
         if env_amount > 0.0:
-            env_level  = float(env.mean())
-            mod_cutoff = base_cutoff + env_amount * (18000.0 - base_cutoff) * env_level
+            filt_level = float(filt_env.mean())
+            mod_cutoff = base_cutoff + env_amount * (18000.0 - base_cutoff) * filt_level
             self.filt.set_cutoff(mod_cutoff)
 
         samples = self.filt.process(samples)
@@ -647,6 +651,11 @@ class LatentSynth:
     def set_decay(self,   ms):    [v.envelope.set_decay(ms)      for v in self._voices]
     def set_sustain(self, level): [v.envelope.set_sustain(level) for v in self._voices]
     def set_release(self, ms):    [v.envelope.set_release(ms)    for v in self._voices]
+
+    def set_fenv_attack(self,  ms):    [v.filter_envelope.set_attack(ms)     for v in self._voices]
+    def set_fenv_decay(self,   ms):    [v.filter_envelope.set_decay(ms)      for v in self._voices]
+    def set_fenv_sustain(self, level): [v.filter_envelope.set_sustain(level) for v in self._voices]
+    def set_fenv_release(self, ms):    [v.filter_envelope.set_release(ms)    for v in self._voices]
 
     def set_cutoff(self, hz):
         self._base_cutoff = hz
@@ -1018,7 +1027,7 @@ class SynthUI:
 
     def _build_ui(self):
         root = self.root
-        PAD  = 8
+        PAD  = 6
 
         # ── Window chrome ──────────────────────────────────────────────
         chrome = tk.Frame(root, bg=MAC_BLACK, bd=2, relief="solid")
@@ -1141,28 +1150,72 @@ class SynthUI:
         self._build_io_panel(right_col)
 
     # ------------------------------------------------------------------
+    # Collapsible panel helper
+    # ------------------------------------------------------------------
+
+    def _make_collapsible_panel(self, parent, title, pady=(0, 4), start_open=True):
+        """Create a Mac-style bordered panel with a collapsible body.
+
+        Returns (panel, body).  Clicking the ▼/▶ button in the header
+        hides or reveals `body`.  When start_open=False the body starts hidden.
+        """
+        panel = mac_frame(parent)
+        panel.pack(fill="x", pady=pady)
+
+        header = tk.Frame(panel, bg=MAC_BG)
+        header.pack(fill="x", padx=6, pady=(3, 1))
+
+        _open = [start_open]
+
+        toggle_btn = tk.Button(
+            header,
+            text="▼" if start_open else "▶",
+            font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG,
+            relief="flat", bd=0, width=2,
+            activebackground=MAC_BG, cursor="arrow",
+        )
+        toggle_btn.pack(side="left", padx=(0, 2))
+
+        tk.Label(header, text=title,
+                 font=("Monaco", 9, "bold"),
+                 fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+        body = tk.Frame(panel, bg=MAC_BG)
+        if start_open:
+            body.pack(fill="x")
+
+        def _toggle():
+            if _open[0]:
+                body.pack_forget()
+                toggle_btn.config(text="▶")
+            else:
+                body.pack(fill="x")
+                toggle_btn.config(text="▼")
+            _open[0] = not _open[0]
+
+        toggle_btn.config(command=_toggle)
+        # clicking the title label also toggles
+        header.bind("<Button-1>", lambda e: _toggle())
+        return panel, body
+
+    # ------------------------------------------------------------------
     # Envelope panel
     # ------------------------------------------------------------------
 
     def _build_envelope_panel(self, parent):
-        panel = mac_frame(parent)
-        panel.pack(fill="x", pady=(0, 6))
+        _, body = self._make_collapsible_panel(parent, "◆ Envelope", pady=(0, 4))
 
-        tk.Label(panel, text="◆ Envelope",
-                 font=("Monaco", 9, "bold"),
-                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
-
-        sliders_row = tk.Frame(panel, bg=MAC_BG)
-        sliders_row.pack(padx=10, pady=(0, 6))
+        sliders_row = tk.Frame(body, bg=MAC_BG)
+        sliders_row.pack(padx=6, pady=(0, 4))
 
         self._env_readout = tk.StringVar(value="A:10ms  D:100ms  S:0.70  R:300ms")
-        tk.Label(panel, textvariable=self._env_readout,
-                 font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG).pack(pady=(0, 4))
+        tk.Label(body, textvariable=self._env_readout,
+                 font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG).pack(pady=(0, 3))
 
         def make_adsr_slider(col, label, from_, to, init, cmd, cc_key=None):
             f = tk.Frame(sliders_row, bg=MAC_BG)
-            f.grid(row=0, column=col, padx=6)
-            s = mac_slider(f, from_=from_, to=to, command=cmd, length=100)
+            f.grid(row=0, column=col, padx=4)
+            s = mac_slider(f, from_=from_, to=to, command=cmd, length=80)
             s.set(init)
             s.pack()
             tk.Label(f, text=label, font=("Monaco", 9, "bold"),
@@ -1219,23 +1272,18 @@ class SynthUI:
     # ------------------------------------------------------------------
 
     def _build_filter_panel(self, parent):
-        panel = mac_frame(parent)
-        panel.pack(fill="x", pady=(0, 6))
+        _, body = self._make_collapsible_panel(parent, "◆ Filter", pady=(0, 4))
 
-        tk.Label(panel, text="◆ Filter",
-                 font=("Monaco", 9, "bold"),
-                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
-
-        inner = tk.Frame(panel, bg=MAC_BG)
-        inner.pack(padx=8, pady=(0, 6), fill="x")
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
 
         def make_row(label, from_, to, init, cmd, cc_key=None):
             row = tk.Frame(inner, bg=MAC_BG)
-            row.pack(fill="x", pady=2)
+            row.pack(fill="x", pady=1)
             tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
                      bg=MAC_BG, width=10, anchor="w").pack(side="left")
             s = mac_slider(row, from_=from_, to=to, command=cmd,
-                           length=130, orient=tk.HORIZONTAL)
+                           length=110, orient=tk.HORIZONTAL)
             s.set(init)
             s.pack(side="left")
             val_lbl = tk.Label(row, text="", font=FONT_TINY,
@@ -1262,6 +1310,54 @@ class SynthUI:
         self._on_resonance(self._res_sl.get())
         self._on_env_amount(self._env_amt_sl.get())
 
+        # ── Filter envelope (F.Env) ADSR ─────────────────────────────
+        tk.Frame(body, bg=MAC_SHADOW, height=1).pack(fill="x", padx=6, pady=(2, 2))
+
+        fenv_top = tk.Frame(body, bg=MAC_BG)
+        fenv_top.pack(fill="x", padx=6)
+        tk.Label(fenv_top, text="F.Env", font=FONT_TINY,
+                 fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+        self._fenv_readout = tk.StringVar(value="A:10ms  D:100ms  S:0.70  R:300ms")
+        tk.Label(body, textvariable=self._fenv_readout,
+                 font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG).pack(pady=(0, 1))
+
+        fenv_row = tk.Frame(body, bg=MAC_BG)
+        fenv_row.pack(padx=6, pady=(0, 4))
+
+        def make_fenv_slider(col, label, from_, to, init, cmd, cc_key=None):
+            f = tk.Frame(fenv_row, bg=MAC_BG)
+            f.grid(row=0, column=col, padx=4)
+            s = mac_slider(f, from_=from_, to=to, command=cmd, length=70)
+            s.set(init)
+            s.pack()
+            tk.Label(f, text=label, font=("Monaco", 9, "bold"),
+                     fg=MAC_BLACK, bg=MAC_BG).pack()
+            if cc_key:
+                btn = tk.Button(f, text="CC", font=FONT_TINY,
+                                fg=MAC_BLACK, bg=MAC_BG,
+                                relief="raised", bd=2, width=3,
+                                activebackground=MAC_HILIGHT)
+                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
+                btn.pack()
+                self._cc_buttons[cc_key] = btn
+            return s
+
+        self._fatk = make_fenv_slider(0, "A", 100, 0, 30,
+                                      lambda v: self._on_filter_adsr("A", v),
+                                      cc_key="f_attack")
+        self._fdec = make_fenv_slider(1, "D", 100, 0, 55,
+                                      lambda v: self._on_filter_adsr("D", v),
+                                      cc_key="f_decay")
+        self._fsus = make_fenv_slider(2, "S", 100, 0, 70,
+                                      lambda v: self._on_filter_adsr("S", v),
+                                      cc_key="f_sustain")
+        self._frel = make_fenv_slider(3, "R", 100, 0, 60,
+                                      lambda v: self._on_filter_adsr("R", v),
+                                      cc_key="f_release")
+
+        self._apply_filter_adsr()
+
     def _slider_to_cutoff(self, val):
         return 30.0 * (600.0 ** (float(val) / 100.0))
 
@@ -1280,20 +1376,35 @@ class SynthUI:
         self.synth.set_env_amount(amt)
         self._env_amt_lbl.config(text=f"{int(float(val))}%")
 
+    def _on_filter_adsr(self, param, val):
+        self._apply_filter_adsr()
+
+    def _apply_filter_adsr(self):
+        atk_ms = self._log_time(self._fatk.get())
+        dec_ms = self._log_time(self._fdec.get())
+        sus    = self._fsus.get() / 100.0
+        rel_ms = self._log_time(self._frel.get())
+
+        self.synth.set_fenv_attack(atk_ms)
+        self.synth.set_fenv_decay(dec_ms)
+        self.synth.set_fenv_sustain(sus)
+        self.synth.set_fenv_release(rel_ms)
+
+        self._fenv_readout.set(
+            f"A:{atk_ms:.0f}ms  D:{dec_ms:.0f}ms  "
+            f"S:{sus:.2f}  R:{rel_ms:.0f}ms"
+        )
+
     # ------------------------------------------------------------------
     # Motion panel  (LFO + scan sliders + randomize)
     # ------------------------------------------------------------------
 
     def _build_motion_panel(self, parent):
-        panel = mac_frame(parent)
-        panel.pack(fill="x", pady=(0, 6))
+        _, body = self._make_collapsible_panel(
+            parent, "◆ Motion", pady=(0, 6), start_open=False)
 
-        tk.Label(panel, text="◆ Motion",
-                 font=("Monaco", 9, "bold"),
-                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
-
-        inner = tk.Frame(panel, bg=MAC_BG)
-        inner.pack(padx=8, pady=(0, 6), fill="x")
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
 
         # LFO toggle + shape radio buttons
         top = tk.Frame(inner, bg=MAC_BG)
@@ -1329,7 +1440,7 @@ class SynthUI:
             tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
                      bg=MAC_BG, width=7, anchor="w").pack(side="left")
             s = mac_slider(row, from_=from_, to=to, command=cmd,
-                           length=120, orient=tk.HORIZONTAL, resolution=res)
+                           length=100, orient=tk.HORIZONTAL, resolution=res)
             s.set(init)
             s.pack(side="left")
             lbl = tk.Label(row, text="", font=FONT_TINY,
@@ -1486,15 +1597,11 @@ class SynthUI:
     # ------------------------------------------------------------------
 
     def _build_arpeggiator_panel(self, parent):
-        panel = mac_frame(parent)
-        panel.pack(fill="x", pady=(0, 6))
+        _, body = self._make_collapsible_panel(
+            parent, "◆ Arpeggiator", pady=(0, 6), start_open=False)
 
-        tk.Label(panel, text="◆ Arpeggiator",
-                 font=("Monaco", 9, "bold"),
-                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
-
-        inner = tk.Frame(panel, bg=MAC_BG)
-        inner.pack(padx=8, pady=(0, 6), fill="x")
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
 
         # Row 1: ARP toggle + Steps buttons
         row1 = tk.Frame(inner, bg=MAC_BG)
@@ -1536,7 +1643,7 @@ class SynthUI:
             tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
                      bg=MAC_BG, width=7, anchor="w").pack(side="left")
             s = mac_slider(row, from_=from_, to=to, command=cmd,
-                           length=130, orient=tk.HORIZONTAL, resolution=res)
+                           length=110, orient=tk.HORIZONTAL, resolution=res)
             s.set(init)
             s.pack(side="left")
             lbl = tk.Label(row, text="", font=FONT_TINY,
@@ -1653,15 +1760,10 @@ class SynthUI:
     # ------------------------------------------------------------------
 
     def _build_io_panel(self, parent):
-        panel = mac_frame(parent)
-        panel.pack(fill="x")
+        _, body = self._make_collapsible_panel(parent, "◆ I/O", pady=0)
 
-        tk.Label(panel, text="◆ I/O",
-                 font=("Monaco", 9, "bold"),
-                 fg=MAC_BLACK, bg=MAC_BG).pack(anchor="w", padx=6, pady=(4, 2))
-
-        inner = tk.Frame(panel, bg=MAC_BG)
-        inner.pack(padx=6, pady=(0, 6), fill="x")
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
 
         # Gain
         gain_row = tk.Frame(inner, bg=MAC_BG)
@@ -2174,6 +2276,26 @@ class SynthUI:
                 "Z1", LATENT_MIN, LATENT_MAX,
                 lambda v: root.after(
                     0, lambda: (self._z1_sl.set(v), self._on_z1_scan(v))),
+            ),
+            "f_attack": (
+                "F.Attack", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._fatk.set(v), self._apply_filter_adsr())),
+            ),
+            "f_decay": (
+                "F.Decay", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._fdec.set(v), self._apply_filter_adsr())),
+            ),
+            "f_sustain": (
+                "F.Sustain", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._fsus.set(v), self._apply_filter_adsr())),
+            ),
+            "f_release": (
+                "F.Release", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._frel.set(v), self._apply_filter_adsr())),
             ),
         }
         if key not in defs:
