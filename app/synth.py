@@ -1116,18 +1116,6 @@ class SynthUI:
                  relief="sunken", bd=1, padx=4, anchor="w").pack(
                      fill="x", pady=(3, 0))
 
-        # CC learn buttons for latent X / Y
-        cc_row = tk.Frame(left_col, bg=MAC_WHITE)
-        cc_row.pack(fill="x", pady=(2, 0))
-        for _key, _lbl in [("latent_x", "CC X"), ("latent_y", "CC Y")]:
-            _btn = tk.Button(cc_row, text=_lbl, font=FONT_TINY,
-                             fg=MAC_BLACK, bg=MAC_BG,
-                             relief="raised", bd=2, width=5,
-                             activebackground=MAC_HILIGHT)
-            _btn.config(command=lambda k=_key, b=_btn: self._start_learn(k, b))
-            _btn.pack(side="left", padx=(0, 2))
-            self._cc_buttons[_key] = _btn
-
         # ── Waveform display ──────────────────────────────────────────
         tk.Label(left_col, text="◆ Oscillator",
                  font=("Monaco", 9, "bold"),
