@@ -974,6 +974,51 @@ def mac_slider(parent, from_, to, command, length=80,
     )
 
 
+def mac_option_menu(parent, variable, values, command=None, width=18):
+    """Popup-menu button styled like a Mac System 7 popup control.
+
+    Returns a tk.Frame.  The underlying tk.Menu is accessible as ._menu
+    so callers can delete/add items dynamically (e.g. MIDI port refresh).
+    """
+    frame = tk.Frame(parent, bg=MAC_BG, relief="raised", bd=2, cursor="arrow")
+
+    lbl = tk.Label(frame, textvariable=variable, font=FONT_TINY,
+                   fg=MAC_BLACK, bg=MAC_BG, anchor="w", width=width, padx=4)
+    lbl.pack(side="left")
+
+    # Thin vertical rule before the arrow
+    tk.Frame(frame, bg=MAC_BLACK, width=1).pack(side="right", fill="y", pady=2)
+
+    arr = tk.Label(frame, text="▾", font=FONT_TINY,
+                   fg=MAC_BLACK, bg=MAC_BG, padx=4)
+    arr.pack(side="right")
+
+    menu = tk.Menu(parent, tearoff=0, font=FONT_TINY,
+                   bg=MAC_WHITE, fg=MAC_BLACK,
+                   activebackground=MAC_BLACK, activeforeground=MAC_WHITE,
+                   bd=1, relief="solid")
+
+    def _select(v):
+        variable.set(v)
+        if command:
+            command(v)
+
+    for v in values:
+        menu.add_command(label=v, command=lambda val=v: _select(val))
+
+    def _show(event=None):
+        frame.config(relief="sunken")
+        frame.after(100, lambda: frame.config(relief="raised"))
+        menu.tk_popup(frame.winfo_rootx(),
+                      frame.winfo_rooty() + frame.winfo_height())
+
+    for w in (frame, lbl, arr):
+        w.bind("<Button-1>", lambda e: _show())
+
+    frame._menu = menu
+    return frame
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -1977,11 +2022,8 @@ class SynthUI:
                  fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w").pack(side="left")
 
         self._midi_var = tk.StringVar(value="(no ports)")
-        self._midi_menu = tk.OptionMenu(midi_row, self._midi_var, "(no ports)")
-        self._midi_menu.config(font=FONT_TINY, bg=MAC_BG, fg=MAC_BLACK,
-                                relief="raised", bd=2, width=18,
-                                activebackground=MAC_BG)
-        self._midi_menu["menu"].config(font=FONT_TINY, bg=MAC_WHITE)
+        self._midi_menu = mac_option_menu(midi_row, self._midi_var,
+                                          ["(no ports)"], width=18)
         self._midi_menu.pack(side="left")
         mac_button(midi_row, "↺", self._refresh_midi_ports, width=2).pack(
             side="left", padx=(3, 0))
@@ -2001,13 +2043,9 @@ class SynthUI:
             idx = default_out if isinstance(default_out, int) else 0
             self._audio_var.set(output_devices[min(idx, len(output_devices)-1)])
 
-        audio_menu = tk.OptionMenu(audio_row, self._audio_var,
-                                    *output_devices,
-                                    command=self._on_audio_select)
-        audio_menu.config(font=FONT_TINY, bg=MAC_BG, fg=MAC_BLACK,
-                          relief="raised", bd=2, width=18,
-                          activebackground=MAC_BG)
-        audio_menu["menu"].config(font=FONT_TINY, bg=MAC_WHITE)
+        audio_menu = mac_option_menu(audio_row, self._audio_var,
+                                     output_devices,
+                                     command=self._on_audio_select, width=18)
         audio_menu.pack(side="left")
 
         # Keyboard row
@@ -2305,7 +2343,7 @@ class SynthUI:
 
     def _refresh_midi_ports(self, preferred_name: str | None = None):
         ports = self.midi.list_ports()
-        menu  = self._midi_menu["menu"]
+        menu  = self._midi_menu._menu
         menu.delete(0, "end")
         if ports:
             for dev_id, name in ports:
