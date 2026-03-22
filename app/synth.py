@@ -1045,8 +1045,7 @@ class SynthUI:
         self._kb_velocity = KB_DEFAULT_VELOCITY
         self._kb_held     = set()   # held keysyms — prevents OS key-repeat flood
 
-        self._learn_target: dict | None = None  # {'key': str, 'btn': tk.Button}
-        self._cc_buttons:   dict        = {}    # {key: tk.Button}
+        self._learn_target: dict | None = None  # {'key': str}
 
         # LFO: callback fires on main thread via root.after
         self.lfo = LatentLFO(
@@ -1109,6 +1108,12 @@ class SynthUI:
         content = tk.Frame(chrome, bg=MAC_WHITE)
         content.pack(fill="both", expand=True, padx=1, pady=1)
 
+        # CC learn status bar (packed first so it anchors to bottom)
+        self._cc_status_var = tk.StringVar(value="")
+        tk.Label(content, textvariable=self._cc_status_var,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_WHITE,
+                 anchor="w", padx=6).pack(side="bottom", fill="x", pady=(0, 2))
+
         # ── Two-column layout ─────────────────────────────────────────
         columns = tk.Frame(content, bg=MAC_WHITE)
         columns.pack(fill="both", expand=True, padx=PAD, pady=PAD)
@@ -1154,6 +1159,8 @@ class SynthUI:
         self.canvas.bind("<ButtonPress-1>",   self._on_press)
         self.canvas.bind("<B1-Motion>",       self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-2>", self._show_xy_cc_menu)
+        self.canvas.bind("<Button-3>", self._show_xy_cc_menu)
 
         self._coord_var = tk.StringVar(value="z0: +0.000    z1: +0.000")
         tk.Label(left_col, textvariable=self._coord_var,
@@ -1202,6 +1209,9 @@ class SynthUI:
                             bd=1, relief="solid")
         file_menu.add_command(label="Save Preset…", command=self._save_preset)
         file_menu.add_command(label="Load Preset…", command=self._load_preset)
+        file_menu.add_separator()
+        file_menu.add_command(label="Clear All CC Mappings…",
+                              command=self._clear_cc_map)
 
         def _show(event):
             w = event.widget
@@ -1449,13 +1459,7 @@ class SynthUI:
             tk.Label(f, text=label, font=("Monaco", 9, "bold"),
                      fg=MAC_BLACK, bg=MAC_BG).pack()
             if cc_key:
-                btn = tk.Button(f, text="CC", font=FONT_TINY,
-                                fg=MAC_BLACK, bg=MAC_BG,
-                                relief="raised", bd=2, width=3,
-                                activebackground=MAC_HILIGHT)
-                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
-                btn.pack()
-                self._cc_buttons[cc_key] = btn
+                self._bind_cc_rclick(s, cc_key)
             return s
 
         self._atk = make_adsr_slider(0, "A", 100, 0, 30,
@@ -1518,13 +1522,7 @@ class SynthUI:
                                 fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
             val_lbl.pack(side="left", padx=(4, 0))
             if cc_key:
-                btn = tk.Button(row, text="CC", font=FONT_TINY,
-                                fg=MAC_BLACK, bg=MAC_BG,
-                                relief="raised", bd=2, width=3,
-                                activebackground=MAC_HILIGHT)
-                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
-                btn.pack(side="left", padx=(2, 0))
-                self._cc_buttons[cc_key] = btn
+                self._bind_cc_rclick(s, cc_key)
             return s, val_lbl
 
         self._cutoff_sl, self._cutoff_lbl = make_row(
@@ -1562,13 +1560,7 @@ class SynthUI:
             tk.Label(f, text=label, font=("Monaco", 9, "bold"),
                      fg=MAC_BLACK, bg=MAC_BG).pack()
             if cc_key:
-                btn = tk.Button(f, text="CC", font=FONT_TINY,
-                                fg=MAC_BLACK, bg=MAC_BG,
-                                relief="raised", bd=2, width=3,
-                                activebackground=MAC_HILIGHT)
-                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
-                btn.pack()
-                self._cc_buttons[cc_key] = btn
+                self._bind_cc_rclick(s, cc_key)
             return s
 
         self._fatk = make_fenv_slider(0, "A", 100, 0, 30,
@@ -1675,13 +1667,7 @@ class SynthUI:
                             fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
             lbl.pack(side="left", padx=(3, 0))
             if cc_key:
-                btn = tk.Button(row, text="CC", font=FONT_TINY,
-                                fg=MAC_BLACK, bg=MAC_BG,
-                                relief="raised", bd=2, width=3,
-                                activebackground=MAC_HILIGHT)
-                btn.config(command=lambda k=cc_key, b=btn: self._start_learn(k, b))
-                btn.pack(side="left", padx=(2, 0))
-                self._cc_buttons[cc_key] = btn
+                self._bind_cc_rclick(s, cc_key)
             return s, lbl
 
         self._lfo_rate_sl,  self._lfo_rate_lbl  = make_row(
@@ -2006,14 +1992,7 @@ class SynthUI:
         self._gain_lbl = tk.Label(gain_row, text="80%", font=FONT_TINY,
                                    fg=MAC_BLACK, bg=MAC_BG, width=9, anchor="w")
         self._gain_lbl.pack(side="left", padx=(4, 0))
-        _gain_cc_btn = tk.Button(gain_row, text="CC", font=FONT_TINY,
-                                  fg=MAC_BLACK, bg=MAC_BG,
-                                  relief="raised", bd=2, width=3,
-                                  activebackground=MAC_HILIGHT)
-        _gain_cc_btn.config(
-            command=lambda b=_gain_cc_btn: self._start_learn("gain", b))
-        _gain_cc_btn.pack(side="left", padx=(2, 0))
-        self._cc_buttons["gain"] = _gain_cc_btn
+        self._bind_cc_rclick(self._gain_sl, "gain")
 
         # MIDI
         midi_row = tk.Frame(inner, bg=MAC_BG)
@@ -2058,13 +2037,6 @@ class SynthUI:
         self._kb_info_var = tk.StringVar(value=f"Oct:{KB_DEFAULT_OCTAVE}  Vel:{KB_DEFAULT_VELOCITY}")
         tk.Label(kbd_row, textvariable=self._kb_info_var,
                  font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left", padx=(6, 0))
-
-        # CC clear row
-        cc_clear_row = tk.Frame(inner, bg=MAC_BG)
-        cc_clear_row.pack(fill="x", pady=(6, 0))
-        mac_button(cc_clear_row, "CLEAR CC", self._clear_cc_map).pack(side="left")
-        tk.Label(cc_clear_row, text=" clears all MIDI CC assignments",
-                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left")
 
         # Apply defaults
         self._on_gain(80)
@@ -2369,55 +2341,125 @@ class SynthUI:
     # MIDI Learn
     # ------------------------------------------------------------------
 
-    def _start_learn(self, key: str, btn: tk.Button):
-        """Begin or cancel MIDI learn for the given parameter key."""
-        # Cancel if same button clicked while already learning
-        if (self._learn_target is not None
-                and self._learn_target["key"] == key):
-            self.midi._learn_callback = None
-            prev_text = self._learn_target.get("prev_text", "CC")
-            self._learn_target = None
-            btn.config(bg=MAC_BG, text=prev_text)
+    def _start_learn(self, key: str):
+        """Begin (or cancel) MIDI learn for the given parameter key."""
+        # Toggle off if already learning the same key
+        if self._learn_target is not None and self._learn_target["key"] == key:
+            self._cancel_learn()
             return
 
-        # Cancel any previous learn
+        # Cancel any other active learn first
         if self._learn_target is not None:
-            old_btn  = self._learn_target["btn"]
-            old_text = self._learn_target.get("prev_text", "CC")
-            old_btn.config(bg=MAC_BG, text=old_text)
             self.midi._learn_callback = None
+            self._learn_target = None
 
-        prev_text = btn.cget("text")
-        self._learn_target = {"key": key, "btn": btn, "prev_text": prev_text}
-        btn.config(bg="#ffff99", text="...")
+        mapping = self._make_cc_mapping(key)
+        name = mapping.label if mapping else key
+        self._learn_target = {"key": key}
+        self._cc_status_var.set(f"● MIDI Learn: {name} — move a knob or fader")
         self.midi._learn_callback = lambda cc: self.root.after(
             0, self._finish_learn, cc)
 
     def _finish_learn(self, cc_num: int):
-        """Bind cc_num to the pending learn target and update UI."""
+        """Bind cc_num to the pending learn target."""
         if self._learn_target is None:
             return
 
         key = self._learn_target["key"]
-        btn = self._learn_target["btn"]
         self._learn_target = None
+        self.midi._learn_callback = None
 
         # Remove any prior binding for this CC number
         self.midi.cc_map.pop(cc_num, None)
 
         mapping = self._make_cc_mapping(key)
         if mapping is None:
-            btn.config(bg=MAC_BG, text="CC")
+            self._cc_status_var.set("")
             return
 
         self.midi.cc_map[cc_num] = mapping
-        btn.config(bg=MAC_BG, text=str(cc_num))
-
-        # Brief green flash to confirm
-        btn.config(bg="#99ff99")
-        self.root.after(400, lambda: btn.config(bg=MAC_BG))
-
+        self._cc_status_var.set(f"✓  CC {cc_num} → {mapping.label}")
+        self.root.after(2000, lambda: self._cc_status_var.set(""))
         self._save_cc_map()
+
+    # ── Right-click CC helpers ────────────────────────────────────────
+
+    def _bind_cc_rclick(self, widget, key):
+        """Attach a right-click CC context menu to any widget."""
+        for btn in ("<Button-2>", "<Button-3>"):
+            widget.bind(btn, lambda e, k=key: self._show_cc_menu(k, e))
+
+    def _current_cc(self, key):
+        """Return the CC number currently mapped to key, or None."""
+        for cc_num, m in self.midi.cc_map.items():
+            if m.key == key:
+                return cc_num
+        return None
+
+    def _show_cc_menu(self, key, event):
+        """Pop a context menu for assigning/clearing a CC on one parameter."""
+        mapping = self._make_cc_mapping(key)
+        name    = mapping.label if mapping else key
+        cc_num  = self._current_cc(key)
+        learning = (self._learn_target is not None
+                    and self._learn_target["key"] == key)
+
+        menu = tk.Menu(self.root, tearoff=0, font=FONT_SMALL,
+                       bg=MAC_WHITE, fg=MAC_BLACK,
+                       activebackground=MAC_BLACK, activeforeground=MAC_WHITE,
+                       bd=1, relief="solid")
+        if learning:
+            menu.add_command(label=f"● Waiting for CC…  ({name})",
+                             state="disabled")
+            menu.add_separator()
+            menu.add_command(label="Cancel", command=self._cancel_learn)
+        else:
+            menu.add_command(label=f"Assign MIDI CC…  ({name})",
+                             command=lambda: self._start_learn(key))
+            if cc_num is not None:
+                menu.add_separator()
+                menu.add_command(label=f"Currently: CC {cc_num}",
+                                 state="disabled")
+                menu.add_command(label="Clear CC",
+                                 command=lambda: self._clear_one_cc(key))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _show_xy_cc_menu(self, event):
+        """Right-click on the XY pad — shows CC options for both axes."""
+        menu = tk.Menu(self.root, tearoff=0, font=FONT_SMALL,
+                       bg=MAC_WHITE, fg=MAC_BLACK,
+                       activebackground=MAC_BLACK, activeforeground=MAC_WHITE,
+                       bd=1, relief="solid")
+        for key, axis in [("latent_x", "Z0  (X axis)"),
+                           ("latent_y", "Z1  (Y axis)")]:
+            cc_num   = self._current_cc(key)
+            learning = (self._learn_target is not None
+                        and self._learn_target["key"] == key)
+            menu.add_command(label=axis, state="disabled")
+            if learning:
+                menu.add_command(label="  ● Waiting for CC…", state="disabled")
+                menu.add_command(label="  Cancel", command=self._cancel_learn)
+            else:
+                menu.add_command(label="  Assign MIDI CC…",
+                                 command=lambda k=key: self._start_learn(k))
+                if cc_num is not None:
+                    menu.add_command(label=f"  Currently: CC {cc_num}",
+                                     state="disabled")
+                    menu.add_command(label="  Clear CC",
+                                     command=lambda k=key: self._clear_one_cc(k))
+            menu.add_separator()
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _cancel_learn(self):
+        self.midi._learn_callback = None
+        self._learn_target = None
+        self._cc_status_var.set("")
+
+    def _clear_one_cc(self, key):
+        cc_num = self._current_cc(key)
+        if cc_num is not None:
+            self.midi.cc_map.pop(cc_num)
+            self._save_cc_map()
 
     def _make_cc_mapping(self, key: str):
         """Build a CCMapping for the given registry key, or None if unknown."""
@@ -2526,13 +2568,11 @@ class SynthUI:
                          min_val=min_val, max_val=max_val, setter=setter)
 
     def _clear_cc_map(self):
-        """Remove all CC assignments and reset button labels."""
+        """Remove all CC assignments."""
         self.midi.cc_map.clear()
         self.midi._learn_callback = None
         self._learn_target = None
-        for key, btn in self._cc_buttons.items():
-            btn.config(bg=MAC_BG, text="CC" if key not in ("latent_x", "latent_y")
-                       else ("CC X" if key == "latent_x" else "CC Y"))
+        self._cc_status_var.set("")
         self._save_cc_map()
 
     # ------------------------------------------------------------------
@@ -2567,9 +2607,6 @@ class SynthUI:
             if mapping is None:
                 continue
             self.midi.cc_map[cc_num] = mapping
-            btn = self._cc_buttons.get(key)
-            if btn:
-                btn.config(text=str(cc_num))
 
     # ------------------------------------------------------------------
     # Audio
