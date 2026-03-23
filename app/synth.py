@@ -558,6 +558,11 @@ class LatentSynth:
         self._morph = 1.0 if self._morph_rate == 0.0 else 0.0
         return new_wf
 
+    def decode_latent(self, x: float, y: float) -> np.ndarray:
+        """Decode a latent point to a waveform without changing the playing state."""
+        z = np.array([[x, y]], dtype=np.float32)
+        return self.session.run(["waveform"], {"latent": z})[0][0, 0].astype(np.float32)
+
     def set_glide(self, ms: float):
         if ms <= 0.0:
             self._morph_rate = 0.0
@@ -785,14 +790,17 @@ class LatentSynth:
 class MidiInput:
     """
     MIDI input using pygame.midi (PortMidi backend).
+    Supports multiple simultaneous input ports — one polling thread per device.
     Avoids the Python 3.13 GIL crash that affects python-rtmidi.
     """
 
     def __init__(self, synth: LatentSynth):
         self.synth             = synth
-        self._input            = None
-        self._active           = False
-        self._thread           = None
+        # _inputs: all Input objects ever opened (kept alive — PortMidi can't re-open
+        #          a closed device in the same session without reinitialising)
+        self._inputs: dict[int, pygame.midi.Input] = {}
+        # _active_ids: which devices are currently being polled
+        self._active_ids: set[int] = set()
         self.cc_map: dict      = {}    # {cc_num (int): CCMapping}
         self._learn_callback   = None  # callable(cc_num) during MIDI learn, else None
 
@@ -806,23 +814,37 @@ class MidiInput:
                 ports.append((i, info[1].decode("utf-8", errors="replace")))
         return ports
 
-    def open_port(self, device_id: int):
+    @property
+    def open_device_ids(self) -> set:
+        """Device IDs currently being polled."""
+        return set(self._active_ids)
+
+    def toggle_port(self, device_id: int):
+        """Start or stop polling a port. Input object stays open (PortMidi limitation)."""
         if not MIDI_AVAILABLE:
             return
-        self.close()
-        try:
-            self._input  = pygame.midi.Input(device_id)
-            self._active = True
-            self._thread = threading.Thread(target=self._poll, daemon=True)
-            self._thread.start()
-        except Exception as e:
-            print(f"MIDI open error: {e}")
+        if device_id in self._active_ids:
+            # Stop polling — Input object remains open for potential re-activation
+            self._active_ids.discard(device_id)
+        else:
+            # Open the device the first time; reuse the object on subsequent toggles
+            if device_id not in self._inputs:
+                try:
+                    self._inputs[device_id] = pygame.midi.Input(device_id)
+                except Exception as e:
+                    print(f"MIDI open error (device {device_id}): {e}")
+                    return
+            self._active_ids.add(device_id)
+            threading.Thread(target=self._poll_one,
+                             args=(device_id, self._inputs[device_id]),
+                             daemon=True).start()
 
-    def _poll(self):
-        while self._active and self._input:
+    def _poll_one(self, device_id: int, inp: pygame.midi.Input):
+        """Polling loop for a single MIDI input device."""
+        while device_id in self._active_ids:
             try:
-                if self._input.poll():
-                    for event in self._input.read(64):
+                if inp.poll():
+                    for event in inp.read(64):
                         data, _ = event
                         status  = data[0] & 0xF0
                         note    = data[1]
@@ -849,10 +871,14 @@ class MidiInput:
             m.setter(scaled)
 
     def close(self):
-        self._active = False
-        if self._input:
-            self._input.close()
-            self._input = None
+        """Stop all polling and close every open Input object."""
+        self._active_ids.clear()
+        for inp in self._inputs.values():
+            try:
+                inp.close()
+            except Exception:
+                pass
+        self._inputs.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -876,19 +902,22 @@ class LatentLFO:
     X_SCAN = "x_scan"
     Y_SCAN = "y_scan"
     WALK   = "walk"
+    WAVE   = "wave"
 
     def __init__(self, update_fn):
-        self._update_fn = update_fn
-        self.rate     = 0.2     # Hz
-        self.depth    = 1.0     # latent units (radius / amplitude)
-        self.shape    = self.CIRCLE
-        self.center_x = 0.0
-        self.center_y = 0.0
-        self.active   = False
-        self._phase   = 0.0
-        self._wx      = 0.0    # walk state
-        self._wy      = 0.0
-        self._thread  = None
+        self._update_fn      = update_fn
+        self.rate            = 0.2     # Hz
+        self.depth           = 1.0     # latent units (radius / amplitude)
+        self.shape           = self.CIRCLE
+        self.center_x        = 0.0
+        self.center_y        = 0.0
+        self.active          = False
+        self._phase          = 0.0
+        self._wx             = 0.0    # walk state
+        self._wy             = 0.0
+        self._thread         = None
+        self.lfo_waveform: np.ndarray | None = None   # waveform used as LFO shape
+        self.lfo_waveform_name: str = ""
 
     def start(self):
         if self.active:
@@ -920,7 +949,13 @@ class LatentLFO:
             elif self.shape == self.Y_SCAN:
                 x = cx
                 y = cy + d * np.sin(self._phase)
-            else:   # WALK — Ornstein-Uhlenbeck
+            elif self.shape == self.WAVE and self.lfo_waveform is not None:
+                wf  = self.lfo_waveform
+                pos = int((self._phase % (2.0 * np.pi)) / (2.0 * np.pi) * len(wf)) % len(wf)
+                val = float(wf[pos])
+                x   = cx + d * val
+                y   = cy
+            else:   # WALK — Ornstein-Uhlenbeck (also fallback for WAVE with no waveform)
                 theta = 0.08
                 sigma = d * 0.25
                 self._wx += theta * (cx - self._wx) + sigma * rng.standard_normal()
@@ -1183,9 +1218,14 @@ class SynthUI:
         self.wave_canvas.pack()
 
         self._wave_name_var = tk.StringVar(value="")
-        tk.Label(left_col, textvariable=self._wave_name_var,
+        self._wave_name_lbl = tk.Label(left_col, textvariable=self._wave_name_var,
                  font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_WHITE,
-                 anchor="w").pack(fill="x", pady=(1, 0))
+                 anchor="w", cursor="hand2")
+        self._wave_name_lbl.pack(fill="x", pady=(1, 0))
+        self._wave_name_lbl.bind("<Double-Button-1>",
+                                 lambda e: self._open_wave_browser())
+        self.wave_canvas.bind("<Double-Button-1>",
+                              lambda e: self._open_wave_browser())
 
         # ── Right column panels ───────────────────────────────────────
         self._build_envelope_panel(right_col)
@@ -1627,7 +1667,7 @@ class SynthUI:
         inner.pack(padx=6, pady=(0, 4), fill="x")
 
         # LFO toggle + shape radio buttons
-        top = tk.Frame(inner, bg=MAC_BG)
+        top = self._lfo_shape_top = tk.Frame(inner, bg=MAC_BG)
         top.pack(fill="x", pady=(0, 3))
 
         self._lfo_btn = tk.Button(
@@ -1645,6 +1685,7 @@ class SynthUI:
             ("X",    LatentLFO.X_SCAN),
             ("Y",    LatentLFO.Y_SCAN),
             ("Walk", LatentLFO.WALK),
+            ("Wave", LatentLFO.WAVE),
         ]:
             tk.Radiobutton(
                 top, text=label, variable=self._lfo_shape_var, value=val,
@@ -1652,6 +1693,26 @@ class SynthUI:
                 activebackground=MAC_BG, selectcolor=MAC_BG,
                 command=self._on_lfo_shape,
             ).pack(side="left", padx=1)
+
+        # Wave LFO source row (shown only when Wave shape is selected)
+        self._lfo_wave_row = tk.Frame(inner, bg=MAC_BG)
+        self._lfo_wave_name_var = tk.StringVar(value="(none)")
+        tk.Button(
+            self._lfo_wave_row, text="Use Current",
+            font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG,
+            relief="raised", bd=2,
+            activebackground=MAC_HILIGHT,
+            command=self._set_lfo_wave,
+        ).pack(side="left", padx=(0, 2))
+        tk.Button(
+            self._lfo_wave_row, text="Browse…",
+            font=FONT_TINY, fg=MAC_BLACK, bg=MAC_BG,
+            relief="raised", bd=2,
+            activebackground=MAC_HILIGHT,
+            command=self._open_lfo_wave_browser,
+        ).pack(side="left", padx=(0, 4))
+        tk.Label(self._lfo_wave_row, textvariable=self._lfo_wave_name_var,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left")
 
         # Rate / Depth / Z0 / Z1 sliders
         def make_row(label, from_, to, init, cmd, res=0, cc_key=None):
@@ -1719,7 +1780,32 @@ class SynthUI:
             self._lfo_btn.config(text="LFO: ON ")
 
     def _on_lfo_shape(self):
-        self.lfo.shape = self._lfo_shape_var.get()
+        shape = self._lfo_shape_var.get()
+        self.lfo.shape = shape
+        if shape == LatentLFO.WAVE:
+            self._lfo_wave_row.pack(fill="x", pady=(0, 3), after=self._lfo_shape_top)
+        else:
+            self._lfo_wave_row.pack_forget()
+
+    def _set_lfo_wave(self):
+        """Capture the current decoded waveform as the LFO shape."""
+        wf = self.synth._waveform_to.copy()
+        name = self._wave_name_var.get() or "current wave"
+        self._capture_lfo_wave(wf, name)
+
+    def _capture_lfo_wave(self, wf: np.ndarray, name: str):
+        """Store wf as the LFO waveform and update the label."""
+        self.lfo.lfo_waveform = wf
+        self.lfo.lfo_waveform_name = name
+        self._lfo_wave_name_var.set(name)
+
+    def _open_lfo_wave_browser(self):
+        """Open the waveform browser in LFO-pick mode (doesn't move the XY pad)."""
+        self._open_wave_browser(
+            on_select=lambda wf, name: self._capture_lfo_wave(wf, name),
+            title="Set LFO Waveform",
+            browser_attr="_lfo_wave_browser",
+        )
 
     def _on_lfo_rate(self, val):
         # 1-100 slider → 0.05-4 Hz, log scale
@@ -2053,6 +2139,9 @@ class SynthUI:
         self.root.focus_set()
 
     def _refocus_root(self, event):
+        # Don't steal focus from the waveform browser or any other Toplevel
+        if event.widget.winfo_toplevel() is not self.root:
+            return
         self.root.after(1, self.root.focus_set)
 
     def _toggle_kbd(self):
@@ -2063,6 +2152,19 @@ class SynthUI:
 
     def _on_kb_press(self, event):
         keysym = event.keysym.lower()
+
+        # Arrow keys — navigate latent space (always active, independent of piano mode)
+        if keysym in ("left", "right", "up", "down"):
+            step = 0.25 if (event.state & 0x1) else 0.05   # Shift = coarse
+            dx, dy = 0.0, 0.0
+            if keysym == "left":  dx = -step
+            elif keysym == "right": dx =  step
+            elif keysym == "up":    dy =  step
+            elif keysym == "down":  dy = -step
+            nx = float(np.clip(self._latent_x + dx, LATENT_MIN, LATENT_MAX))
+            ny = float(np.clip(self._latent_y + dy, LATENT_MIN, LATENT_MAX))
+            self._move_to_latent(nx, ny)
+            return
 
         # M key always toggles regardless of active state
         if keysym == "m":
@@ -2274,6 +2376,274 @@ class SynthUI:
             return f"{cat} / {stem}"
         return stem
 
+    @staticmethod
+    def _browser_cat(fn: str) -> str:
+        """Human-readable category using parts[1] as grouper (~530 buckets)."""
+        parts = fn.replace("\\", "/").split("/")
+        if len(parts) < 3:
+            return "(Other)"
+        dev = parts[0]
+        sub = parts[1]
+
+        if dev == "AKWF":
+            # Named sub-dirs: AKWF_clavinet → "Clavinet"
+            # Numeric sub-dirs: AKWF_0001 → "AKWF Original  /  Pack 1"
+            s = sub[5:] if sub.upper().startswith("AKWF_") else sub
+            try:
+                return f"AKWF Original  /  Pack {int(s)}"
+            except ValueError:
+                return s.replace("_", " ").replace("-", " ").title()
+
+        # Device-based collections
+        dev_clean = (dev[6:].replace("--", " · ").replace("-", " ")
+                     if dev.upper().startswith("AKWF--") else dev)
+
+        if sub.upper().startswith("AKWF_"):
+            suffix = sub[5:]
+            try:
+                sub_label = f"Pack {int(suffix)}"
+            except ValueError:
+                sub_label = suffix.replace("_", " ").title()
+        elif sub.upper().startswith("AKWF-"):
+            sub_label = sub[5:]   # "1024", "512", "64" for Surge
+        else:
+            sub_label = sub.replace("-", " ").replace("_", " ").title()
+
+        return f"{dev_clean}  /  {sub_label}"
+
+    @staticmethod
+    def _browser_wave_name(fn: str) -> str:
+        """Stem with leading AKWF_ stripped for readability."""
+        stem = os.path.splitext(fn.replace("\\", "/").split("/")[-1])[0]
+        return stem[5:] if stem.upper().startswith("AKWF_") else stem
+
+    def _open_wave_browser(self, on_select=None, title="Browse Waveforms",
+                           browser_attr="_wave_browser"):
+        """
+        Open the waveform browser.
+        on_select(wf, name) — if given, called with the decoded waveform instead of
+        moving the XY pad.  Used for LFO-pick mode.
+        browser_attr — instance attribute used to track the window (prevents duplicates).
+        """
+        if self._wave_tree is None:
+            messagebox.showinfo("No index",
+                                "Latent index not loaded.\n"
+                                "Run export/build_latent_index.py first.")
+            return
+
+        # Only one browser of each kind at a time
+        existing = getattr(self, browser_attr, None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            return
+
+        # ── Pre-build category → [(idx, display_name)] map ──────────
+        categories: dict[str, list] = {}
+        for idx, fn in enumerate(self._wave_filenames):
+            cat  = self._browser_cat(fn)
+            name = self._browser_wave_name(fn)
+            categories.setdefault(cat, []).append((idx, name))
+        sorted_cats = sorted(categories)
+
+        # ── Window ───────────────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        win.configure(bg=MAC_BG)
+        # transient keeps it above the main window without being modal
+        # (grab_set() is what makes a window modal — we intentionally skip that)
+        win.transient(self.root)
+        win.lift()
+        setattr(self, browser_attr, win)
+        content = win
+
+        # Search bar
+        search_row = tk.Frame(content, bg=MAC_BG)
+        search_row.pack(fill="x", padx=8, pady=(8, 4))
+        tk.Label(search_row, text="Search:", font=FONT_SMALL,
+                 fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(search_row, textvariable=search_var,
+                                font=FONT_SMALL, bg=MAC_WHITE, fg=MAC_BLACK,
+                                relief="sunken", bd=2, width=28,
+                                insertbackground=MAC_BLACK)
+        search_entry.pack(side="left", padx=(4, 0))
+
+        # ── Two-panel body ───────────────────────────────────────────
+        body = tk.Frame(content, bg=MAC_BG)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        def make_lb_frame(parent, width, label_text):
+            outer = tk.Frame(parent, bg=MAC_BG)
+            outer.pack(side="left", fill="y", padx=(0, 4))
+            tk.Label(outer, text=label_text, font=FONT_TINY,
+                     fg=MAC_SHADOW, bg=MAC_BG, anchor="w").pack(fill="x")
+            box_frame = tk.Frame(outer, bg=MAC_BLACK, bd=1, relief="solid")
+            box_frame.pack()
+            lb = tk.Listbox(box_frame, font=FONT_TINY,
+                            bg=MAC_WHITE, fg=MAC_BLACK,
+                            selectbackground=MAC_BLACK,
+                            selectforeground=MAC_WHITE,
+                            width=width, height=22,
+                            relief="flat", bd=0,
+                            exportselection=False,
+                            activestyle="none")
+            sb = tk.Scrollbar(box_frame, orient="vertical", command=lb.yview)
+            lb.config(yscrollcommand=sb.set)
+            lb.pack(side="left")
+            sb.pack(side="right", fill="y")
+            return lb
+
+        cat_lb  = make_lb_frame(body, 24, "Category")
+        wave_lb = make_lb_frame(body, 30, "Waveform")
+
+        for cat in sorted_cats:
+            cat_lb.insert("end", f"{cat}  ({len(categories[cat])})")
+
+        # Tracks which _wave_filenames indices are shown in wave_lb
+        _items: list[int] = []
+
+        def populate_waves(items):
+            _items.clear()
+            wave_lb.delete(0, "end")
+            for idx, name in items:
+                wave_lb.insert("end", f"  {name}")
+                _items.append(idx)
+
+        _suppress_search = [False]
+
+        def on_cat_select(event=None):
+            sel = cat_lb.curselection()
+            if not sel:
+                return
+            cat = sorted_cats[sel[0]]
+            _suppress_search[0] = True
+            search_var.set("")
+            _suppress_search[0] = False
+            populate_waves(categories[cat])
+
+        def on_search(*_):
+            if _suppress_search[0]:
+                return
+            term = search_var.get().strip().lower()
+            if not term:
+                sel = cat_lb.curselection()
+                if sel:
+                    on_cat_select()
+                return
+            cat_lb.selection_clear(0, "end")
+            results = []
+            for idx, fn in enumerate(self._wave_filenames):
+                cat  = self._browser_cat(fn)
+                name = self._browser_wave_name(fn)
+                full = f"{cat} {name}".lower()
+                if term in full:
+                    results.append((idx, f"{cat}  /  {name}"))
+                    if len(results) >= 500:
+                        break
+            populate_waves(results)
+
+        def on_wave_select(event=None):
+            sel = wave_lb.curselection()
+            if not sel or not _items:
+                return
+            idx  = _items[sel[0]]
+            x, y = float(self._wave_tree.data[idx][0]), \
+                   float(self._wave_tree.data[idx][1])
+            if on_select:
+                name = self._browser_wave_name(self._wave_filenames[idx])
+                wf   = self.synth.decode_latent(x, y)
+                on_select(wf, name)
+            else:
+                self._move_to_latent(x, y)
+
+        cat_lb.bind("<<ListboxSelect>>", on_cat_select)
+        wave_lb.bind("<<ListboxSelect>>", on_wave_select)
+        search_var.trace_add("write", lambda *_: on_search())
+
+        # ── Waveform preview canvas ───────────────────────────────────
+        PW, PH = 380, 52          # preview width / height in pixels
+        preview_frame = tk.Frame(content, bg=MAC_BG)
+        preview_frame.pack(fill="x", padx=8, pady=(6, 2))
+
+        preview_name_var = tk.StringVar(value="")
+        tk.Label(preview_frame, textvariable=preview_name_var,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG,
+                 anchor="w").pack(fill="x")
+
+        pv_box = tk.Frame(preview_frame, bg=MAC_BLACK, bd=1, relief="solid")
+        pv_box.pack(fill="x")
+        pv = tk.Canvas(pv_box, width=PW, height=PH,
+                       bg=MAC_WHITE, highlightthickness=0)
+        pv.pack(fill="x")
+
+        def draw_preview(wf, name):
+            pv.delete("all")
+            preview_name_var.set(name)
+            if wf is None:
+                return
+            n      = len(wf)
+            margin = 4
+            w      = pv.winfo_width() or PW
+            pts    = []
+            for px in range(w - 2 * margin):
+                sample = float(wf[int(px / (w - 2 * margin) * n) % n])
+                sample = max(-1.0, min(1.0, sample))
+                py = margin + (1.0 - sample) / 2.0 * (PH - 2 * margin)
+                pts.extend([px + margin, py])
+            if len(pts) >= 4:
+                pv.create_line(pts, fill=MAC_BLACK, width=1, smooth=False)
+
+        # Hover decode — stale-request counter prevents old threads clobbering newer ones
+        _hover_req   = [0]
+        _hover_cache: dict[int, np.ndarray] = {}
+
+        def on_wave_hover(event):
+            row = wave_lb.nearest(event.y)
+            if row < 0 or row >= len(_items):
+                return
+            idx = _items[row]
+            name = "  " + self._browser_wave_name(self._wave_filenames[idx])
+
+            # Cache hit — draw immediately
+            if idx in _hover_cache:
+                draw_preview(_hover_cache[idx], name)
+                return
+
+            # Cache miss — decode in background
+            _hover_req[0] += 1
+            req = _hover_req[0]
+
+            def _decode():
+                x, y = float(self._wave_tree.data[idx][0]), \
+                       float(self._wave_tree.data[idx][1])
+                wf = self.synth.decode_latent(x, y)
+                if _hover_req[0] == req:           # still the latest request?
+                    _hover_cache[idx] = wf
+                    win.after(0, draw_preview, wf, name)
+
+            threading.Thread(target=_decode, daemon=True).start()
+
+        wave_lb.bind("<Motion>", on_wave_hover)
+        wave_lb.bind("<Leave>",  lambda e: preview_name_var.set(""))
+
+        # Select first category on open
+        if sorted_cats:
+            cat_lb.selection_set(0)
+            on_cat_select()
+
+        # Bottom row: hint + close button
+        bottom = tk.Frame(content, bg=MAC_BG)
+        bottom.pack(fill="x", padx=8, pady=(2, 8))
+        hint = "Click to set LFO shape." if on_select else "Click to select  ·  hover to preview"
+        tk.Label(bottom, text=hint,
+                 font=FONT_TINY, fg=MAC_SHADOW, bg=MAC_BG).pack(side="left")
+        tk.Button(bottom, text="Close", font=FONT_SMALL,
+                  bg=MAC_BG, fg=MAC_BLACK, relief="raised", bd=2,
+                  command=win.destroy).pack(side="right")
+
+        search_entry.focus_set()
+
     def _update_wave_name(self, waveform: np.ndarray):
         if self._wave_tree is not None:
             _, idx = self._wave_tree.query([self._latent_x, self._latent_y])
@@ -2313,29 +2683,46 @@ class SynthUI:
     # MIDI
     # ------------------------------------------------------------------
 
-    def _refresh_midi_ports(self, preferred_name: str | None = None):
+    def _refresh_midi_ports(self, preferred_names: list | None = None):
         ports = self.midi.list_ports()
         menu  = self._midi_menu._menu
         menu.delete(0, "end")
         if ports:
+            # Auto-open preferred ports on load
+            if preferred_names:
+                for dev_id, name in ports:
+                    if name in preferred_names and dev_id not in self.midi.open_device_ids:
+                        self.midi.toggle_port(dev_id)
+            elif not self.midi.open_device_ids:
+                # No saved preference — open the first port by default
+                self.midi.toggle_port(ports[0][0])
+
             for dev_id, name in ports:
                 menu.add_command(
                     label=name,
-                    command=lambda d=dev_id, n=name: self._select_midi_port(d, n))
-            # Pick the preferred port if available, otherwise the first one
-            match = next(((d, n) for d, n in ports if n == preferred_name), None)
-            dev_id, name = match if match else ports[0]
-            self._select_midi_port(dev_id, name, save=False)
+                    command=lambda d=dev_id, n=name: self._toggle_midi_port(d, n))
+            self._update_midi_label(ports)
         else:
             self._midi_var.set("(no ports)")
             menu.add_command(label="(no ports)", command=lambda: None)
 
-    def _select_midi_port(self, dev_id: int, name: str, save: bool = True):
-        """Open a MIDI port and optionally persist the choice."""
-        self._midi_var.set(name)
-        self.midi.open_port(dev_id)
-        if save:
-            self._save_settings()
+    def _toggle_midi_port(self, dev_id: int, name: str):
+        """Toggle a MIDI port on/off and refresh the label."""
+        self.midi.toggle_port(dev_id)
+        ports = self.midi.list_ports()
+        self._update_midi_label(ports)
+        self._save_settings()
+
+    def _update_midi_label(self, ports: list):
+        """Update the MIDI dropdown label to reflect active ports."""
+        active_names = [name for dev_id, name in ports
+                        if dev_id in self.midi.open_device_ids]
+        if not active_names:
+            self._midi_var.set("(none)")
+        elif len(active_names) == 1:
+            self._midi_var.set(active_names[0])
+        else:
+            self._midi_var.set(f"{len(active_names)} ports active")
 
     # ------------------------------------------------------------------
     # MIDI Learn
@@ -2622,7 +3009,10 @@ class SynthUI:
     # ------------------------------------------------------------------
 
     def _save_settings(self):
-        data = {"midi_port": self._midi_var.get()}
+        ports = self.midi.list_ports()
+        active_names = [name for dev_id, name in ports
+                        if dev_id in self.midi.open_device_ids]
+        data = {"midi_ports": active_names}
         try:
             with open(SETTINGS_PATH, "w") as f:
                 json.dump(data, f)
@@ -2638,9 +3028,10 @@ class SynthUI:
         except Exception as e:
             print(f"Settings load error: {e}")
             return
-        saved_port = data.get("midi_port")
-        if saved_port:
-            self._refresh_midi_ports(preferred_name=saved_port)
+        # Support both old single-port ("midi_port") and new multi-port ("midi_ports")
+        saved = data.get("midi_ports") or ([data["midi_port"]] if data.get("midi_port") else None)
+        if saved:
+            self._refresh_midi_ports(preferred_names=saved)
 
     # ------------------------------------------------------------------
     # Run
