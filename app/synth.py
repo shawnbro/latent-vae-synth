@@ -47,7 +47,7 @@ BLOCK_SIZE   = 512
 WAVEFORM_LEN = 2048
 LATENT_MIN   = -4.0
 LATENT_MAX   =  4.0
-MAX_VOICES   = 8
+MAX_VOICES   = 16
 PAD_SIZE     = 300
 WAVE_WIDTH   = 300
 WAVE_HEIGHT  = 60
@@ -246,6 +246,162 @@ class BiquadFilter:
         y,  self._zi1 = lfilter(self._b1, self._a1, x64, zi=self._zi1)
         y,  self._zi2 = lfilter(self._b2, self._a2, y,   zi=self._zi2)
         return np.clip(y, -1.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Schroeder Reverb  (Freeverb-style)
+# ---------------------------------------------------------------------------
+
+class SchroederReverb:
+    """
+    8 parallel comb filters + 4 series all-pass filters (Freeverb topology).
+    Fully vectorised: circular-buffer reads/writes are numpy slices; the only
+    sequential dependency (per-comb 1-pole lowpass) is handled with lfilter.
+    """
+    COMB_LENGTHS    = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617]
+    ALLPASS_LENGTHS = [225, 341, 441, 556]
+
+    def __init__(self):
+        self.room_size = 0.5   # 0–1 → feedback 0.70–0.98
+        self.damp      = 0.5   # 0–1 → one-pole lowpass strength
+        self.wet       = 0.0   # output mix (0 = dry, 1 = wet)
+
+        self._comb_bufs = [np.zeros(L, dtype=np.float64) for L in self.COMB_LENGTHS]
+        self._comb_pos  = [0] * len(self.COMB_LENGTHS)
+        self._comb_flt  = [0.0] * len(self.COMB_LENGTHS)  # per-comb 1-pole state
+
+        self._ap_bufs = [np.zeros(L, dtype=np.float64) for L in self.ALLPASS_LENGTHS]
+        self._ap_pos  = [0] * len(self.ALLPASS_LENGTHS)
+
+    @staticmethod
+    def _circ_read(buf, pos, n):
+        L = len(buf)
+        if pos + n <= L:
+            return buf[pos:pos + n].copy()
+        cut = L - pos
+        return np.concatenate([buf[pos:], buf[:n - cut]])
+
+    @staticmethod
+    def _circ_write(buf, pos, data):
+        n, L = len(data), len(buf)
+        if pos + n <= L:
+            buf[pos:pos + n] = data
+        else:
+            cut = L - pos
+            buf[pos:] = data[:cut]
+            buf[:n - cut] = data[cut:]
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if self.wet == 0.0:
+            return x
+
+        n    = len(x)
+        x64  = x.astype(np.float64)
+        wet  = np.zeros(n, dtype=np.float64)
+
+        fb    = 0.7 + self.room_size * 0.28   # 0.70–0.98
+        damp1 = self.damp * 0.4                # IIR feedback coeff
+        damp2 = 1.0 - damp1                    # IIR input coeff
+
+        # 8 parallel comb filters (all delay lengths > BLOCK_SIZE → no overlap)
+        for ci in range(len(self.COMB_LENGTHS)):
+            buf = self._comb_bufs[ci]
+            pos = self._comb_pos[ci]
+
+            old = self._circ_read(buf, pos, n)
+
+            # 1-pole lowpass on the output before feeding back
+            filtered, zo = lfilter([damp2], [1.0, -damp1], old,
+                                   zi=np.array([self._comb_flt[ci]]))
+            self._comb_flt[ci] = float(zo[0])
+
+            self._circ_write(buf, pos, x64 + filtered * fb)
+            self._comb_pos[ci] = (pos + n) % len(buf)
+            wet += old
+
+        wet *= 1.0 / len(self.COMB_LENGTHS)
+
+        # 4 series all-pass filters.
+        # Some allpass buffers are shorter than BLOCK_SIZE (e.g. 225 < 512).
+        # Processing must happen in sub-blocks of ≤ L to avoid read/write overlap.
+        AP_GAIN = 0.5
+        for ai in range(len(self.ALLPASS_LENGTHS)):
+            buf   = self._ap_bufs[ai]
+            L     = len(buf)
+            pos   = self._ap_pos[ai]
+            start = 0
+            while start < n:
+                chunk = min(n - start, L)
+                cpos  = (pos + start) % L
+                # Read chunk samples — guaranteed no double-wrap since chunk ≤ L
+                if cpos + chunk <= L:
+                    old = buf[cpos:cpos + chunk].copy()
+                else:
+                    cut = L - cpos
+                    old = np.concatenate([buf[cpos:], buf[:chunk - cut]])
+                # Write new values
+                new_data = wet[start:start + chunk] + AP_GAIN * old
+                if cpos + chunk <= L:
+                    buf[cpos:cpos + chunk] = new_data
+                else:
+                    cut = L - cpos
+                    buf[cpos:]      = new_data[:cut]
+                    buf[:chunk-cut] = new_data[cut:]
+                wet[start:start + chunk] = old - AP_GAIN * wet[start:start + chunk]
+                start += chunk
+            self._ap_pos[ai] = (pos + n) % L
+
+        return (x64 * (1.0 - self.wet) + wet * self.wet).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Feedback Delay
+# ---------------------------------------------------------------------------
+
+class FeedbackDelay:
+    """
+    Single circular-buffer feedback delay.  Fully vectorised since
+    delay_samples > BLOCK_SIZE always holds for musically useful times.
+    """
+    _MAX_SAMPLES = SAMPLE_RATE * 2   # 2-second buffer
+
+    def __init__(self):
+        self.time_ms  = 250.0   # 20–1000 ms
+        self.feedback = 0.4     # 0–0.9
+        self.wet      = 0.0     # 0–1
+
+        self._buf = np.zeros(self._MAX_SAMPLES, dtype=np.float32)
+        self._pos = 0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if self.wet == 0.0:
+            return x
+
+        n   = len(x)
+        L   = self._MAX_SAMPLES
+        ds  = max(n + 1, min(int(self.time_ms * SAMPLE_RATE / 1000.0), L - 1))
+        buf = self._buf
+
+        # Read from delay_samples ago (non-overlapping with write region)
+        rp = (self._pos - ds) % L
+        if rp + n <= L:
+            delayed = buf[rp:rp + n].copy()
+        else:
+            cut = L - rp
+            delayed = np.concatenate([buf[rp:], buf[:n - cut]])
+
+        # Write input + feedback×delayed
+        wd  = x + delayed * self.feedback
+        pos = self._pos
+        if pos + n <= L:
+            buf[pos:pos + n] = wd
+        else:
+            cut = L - pos
+            buf[pos:]       = wd[:cut]
+            buf[:n - cut]   = wd[cut:]
+
+        self._pos = (pos + n) % L
+        return x * (1.0 - self.wet) + delayed * self.wet
 
 
 # ---------------------------------------------------------------------------
@@ -456,9 +612,10 @@ class Voice:
         return self.envelope.state != ADSREnvelope.IDLE
 
     def note_on(self, midi_note: int, velocity: int, cutoff: float, resonance: float,
-                waveform: np.ndarray | None = None):
+                waveform: np.ndarray | None = None, detune_cents: float = 0.0):
         self.midi_note  = midi_note
-        self._frequency = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+        self._frequency = (440.0 * (2.0 ** ((midi_note - 69) / 12.0))
+                           * (2.0 ** (detune_cents / 1200.0)))
         self._velocity  = velocity / 127.0
         self._own_waveform = waveform      # None → use global; array → per-voice
         self.filt.set_cutoff(cutoff)
@@ -526,7 +683,24 @@ class LatentSynth:
         self._osc_buf   = np.zeros(_OSC_LEN, dtype=np.float32)
         self._osc_pos   = 0    # write head
 
+        # Current latent position (needed by _voice_waveform)
+        self._latent_x = 0.0
+        self._latent_y = 0.0
+
         self.set_latent(0.0, 0.0)
+
+        # Effects
+        self._reverb = SchroederReverb()
+        self._delay  = FeedbackDelay()
+
+        # Velocity → latent expression
+        self._vel_latent_depth = 0.0   # 0–2 latent units
+        self._vel_latent_angle = 0.0   # 0–360°
+
+        # Unison
+        self._unison_voices = 1
+        self._unison_detune = 20.0     # cents, total spread
+        self._unison_spread = 0.0      # latent units, total spread
 
         # Arpeggiator
         self._arp_enabled = False
@@ -543,6 +717,8 @@ class LatentSynth:
     # ------------------------------------------------------------------
 
     def set_latent(self, x: float, y: float):
+        self._latent_x = x
+        self._latent_y = y
         z = np.array([[x, y]], dtype=np.float32)
         new_wf = self.session.run(["waveform"], {"latent": z})[0][0, 0].astype(np.float32)
 
@@ -575,6 +751,36 @@ class LatentSynth:
         z = np.array([[x, y]], dtype=np.float32)
         return self.session.run(["waveform"], {"latent": z})[0][0, 0].astype(np.float32)
 
+    def _voice_waveform(self, velocity: int, voice_idx: int,
+                        n_voices: int) -> np.ndarray | None:
+        """
+        Compute the per-voice waveform offset from vel→latent + unison spread.
+        Returns None when both features are off (caller uses global waveform).
+        """
+        # Velocity → latent offset along a chosen angle
+        if self._vel_latent_depth > 0.0:
+            angle_rad = np.radians(self._vel_latent_angle)
+            scale     = (velocity / 127.0 - 0.5) * 2.0 * self._vel_latent_depth
+            vel_dx    = scale * np.cos(angle_rad)
+            vel_dy    = scale * np.sin(angle_rad)
+        else:
+            vel_dx = vel_dy = 0.0
+
+        # Unison spread — linear along X axis
+        if n_voices > 1 and self._unison_spread > 0.0:
+            frac      = voice_idx / (n_voices - 1) - 0.5   # -0.5 to +0.5
+            spread_dx = frac * self._unison_spread
+            spread_dy = 0.0
+        else:
+            spread_dx = spread_dy = 0.0
+
+        if vel_dx == 0.0 and vel_dy == 0.0 and spread_dx == 0.0 and spread_dy == 0.0:
+            return None  # no offset → use global waveform, skip ONNX call
+
+        ox = float(np.clip(self._latent_x + vel_dx + spread_dx, LATENT_MIN, LATENT_MAX))
+        oy = float(np.clip(self._latent_y + vel_dy + spread_dy, LATENT_MIN, LATENT_MAX))
+        return self._decode_latent(ox, oy)
+
     # ------------------------------------------------------------------
     # MIDI
     # ------------------------------------------------------------------
@@ -584,27 +790,40 @@ class LatentSynth:
             self.arp.add_held(midi_note)
             return
 
-        # Retrigger if already playing this note
-        for v in self._voices:
-            if v.midi_note == midi_note:
-                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
-                return
+        n = self._unison_voices
 
-        # Prefer a free (IDLE) voice
-        for v in self._voices:
-            if not v.active:
-                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
-                return
+        # Retrigger: update all existing voices for this note
+        active_for_note = [v for v in self._voices if v.midi_note == midi_note]
+        if active_for_note:
+            for i, v in enumerate(active_for_note):
+                det = (i / (n - 1) - 0.5) * self._unison_detune if n > 1 else 0.0
+                wf  = self._voice_waveform(velocity, i, n)
+                v.note_on(midi_note, velocity, self._base_cutoff, self._resonance,
+                          wf, det)
+            return
 
-        # Steal: quietest releasing voice first, then quietest overall
-        best = min(
-            (v for v in self._voices if v.envelope.state == ADSREnvelope.RELEASE),
-            key=lambda v: v.envelope.level,
-            default=None,
-        )
-        if best is None:
-            best = min(self._voices, key=lambda v: v.envelope.level)
-        best.note_on(midi_note, velocity, self._base_cutoff, self._resonance)
+        # Fresh note: collect n voice slots
+        voices_to_use: list[Voice] = []
+        free = [v for v in self._voices if not v.active]
+        for v in free[:n]:
+            voices_to_use.append(v)
+
+        # Steal if we still need more
+        needed = n - len(voices_to_use)
+        while needed > 0:
+            candidates = [v for v in self._voices if v not in voices_to_use]
+            releasing  = [v for v in candidates
+                          if v.envelope.state == ADSREnvelope.RELEASE]
+            steal = (min(releasing, key=lambda v: v.envelope.level)
+                     if releasing
+                     else min(candidates, key=lambda v: v.envelope.level))
+            voices_to_use.append(steal)
+            needed -= 1
+
+        for i, v in enumerate(voices_to_use):
+            det = (i / (n - 1) - 0.5) * self._unison_detune if n > 1 else 0.0
+            wf  = self._voice_waveform(velocity, i, n)
+            v.note_on(midi_note, velocity, self._base_cutoff, self._resonance, wf, det)
 
     def note_off(self, midi_note: int):
         if self._arp_enabled:
@@ -613,7 +832,6 @@ class LatentSynth:
         for v in self._voices:
             if v.midi_note == midi_note:
                 v.note_off()
-                return
 
     def arp_note_on(self, midi_note: int, velocity: int,
                     waveform: np.ndarray | None = None):
@@ -680,6 +898,23 @@ class LatentSynth:
     def set_gain(self, g: float):
         self._gain = float(np.clip(g, 0.0, 1.0))
 
+    # Effects
+    def set_reverb_size(self, v):     self._reverb.room_size = float(np.clip(v, 0.0, 1.0))
+    def set_reverb_damp(self, v):     self._reverb.damp      = float(np.clip(v, 0.0, 1.0))
+    def set_reverb_wet(self, v):      self._reverb.wet       = float(np.clip(v, 0.0, 1.0))
+    def set_delay_time(self, ms):     self._delay.time_ms    = float(np.clip(ms, 20.0, 1000.0))
+    def set_delay_feedback(self, v):  self._delay.feedback   = float(np.clip(v, 0.0, 0.9))
+    def set_delay_wet(self, v):       self._delay.wet        = float(np.clip(v, 0.0, 1.0))
+
+    # Velocity → latent
+    def set_vel_latent_depth(self, v): self._vel_latent_depth = float(np.clip(v, 0.0, 2.0))
+    def set_vel_latent_angle(self, v): self._vel_latent_angle = float(v) % 360.0
+
+    # Unison
+    def set_unison_voices(self, n):   self._unison_voices = int(np.clip(n, 1, 7))
+    def set_unison_detune(self, c):   self._unison_detune = float(np.clip(c, 0.0, 100.0))
+    def set_unison_spread(self, v):   self._unison_spread = float(np.clip(v, 0.0, 2.0))
+
     # ------------------------------------------------------------------
     # Arpeggiator control
     # ------------------------------------------------------------------
@@ -735,6 +970,10 @@ class LatentSynth:
 
         if n_active > 0:
             mix *= self._gain / (n_active ** 0.5)
+
+        # Effects chain
+        mix = self._delay.process(mix)
+        mix = self._reverb.process(mix)
 
         # Feed oscilloscope ring buffer
         buf_len = len(self._osc_buf)
@@ -1232,6 +1471,8 @@ class SynthUI:
         self._build_filter_panel(right_col)
         self._build_motion_panel(right_col)
         self._build_arpeggiator_panel(right_col)
+        self._build_fx_panel(right_col)
+        self._build_voices_panel(right_col)
         self._build_io_panel(right_col)
 
     # ------------------------------------------------------------------
@@ -1301,13 +1542,27 @@ class SynthUI:
             "z1":         float(self._z1_sl.get()),
             # arpeggiator
             "arp_enabled": self.synth._arp_enabled,
-            "arp_steps":   self.synth._arp_steps,
+            "arp_steps":   self.synth.arp.n_steps,
             "arp_order":   self._arp_order_var.get(),
             "arp_bpm":     float(self._arp_bpm_sl.get()),
             "arp_gate":    float(self._arp_gate_sl.get()),
             "arp_step_positions": steps,
             # gain
             "gain": float(self._gain_sl.get()),
+            # fx
+            "rev_size":     float(self._rev_size_sl.get()),
+            "rev_damp":     float(self._rev_damp_sl.get()),
+            "rev_wet":      float(self._rev_wet_sl.get()),
+            "dly_time":     float(self._dly_time_sl.get()),
+            "dly_feedback": float(self._dly_fb_sl.get()),
+            "dly_wet":      float(self._dly_wet_sl.get()),
+            # vel → latent
+            "vel_depth": float(self._vel_depth_sl.get()),
+            "vel_angle": float(self._vel_angle_sl.get()),
+            # unison
+            "uni_voices": int(self._uni_voices_sl.get()),
+            "uni_detune": float(self._uni_detune_sl.get()),
+            "uni_spread": float(self._uni_spread_sl.get()),
         }
 
     def _apply_preset(self, d: dict):
@@ -1392,6 +1647,34 @@ class SynthUI:
         if "gain" in d:
             self._gain_sl.set(g("gain"))
             self._on_gain(g("gain"))
+
+        # FX
+        if "rev_size" in d:
+            self._rev_size_sl.set(g("rev_size")); self._on_rev_size(g("rev_size"))
+        if "rev_damp" in d:
+            self._rev_damp_sl.set(g("rev_damp")); self._on_rev_damp(g("rev_damp"))
+        if "rev_wet" in d:
+            self._rev_wet_sl.set(g("rev_wet")); self._on_rev_wet(g("rev_wet"))
+        if "dly_time" in d:
+            self._dly_time_sl.set(g("dly_time")); self._on_dly_time(g("dly_time"))
+        if "dly_feedback" in d:
+            self._dly_fb_sl.set(g("dly_feedback")); self._on_dly_fb(g("dly_feedback"))
+        if "dly_wet" in d:
+            self._dly_wet_sl.set(g("dly_wet")); self._on_dly_wet(g("dly_wet"))
+
+        # Vel → latent
+        if "vel_depth" in d:
+            self._vel_depth_sl.set(g("vel_depth")); self._on_vel_depth(g("vel_depth"))
+        if "vel_angle" in d:
+            self._vel_angle_sl.set(g("vel_angle")); self._on_vel_angle(g("vel_angle"))
+
+        # Unison
+        if "uni_voices" in d:
+            self._uni_voices_sl.set(g("uni_voices")); self._on_uni_voices(g("uni_voices"))
+        if "uni_detune" in d:
+            self._uni_detune_sl.set(g("uni_detune")); self._on_uni_detune(g("uni_detune"))
+        if "uni_spread" in d:
+            self._uni_spread_sl.set(g("uni_spread")); self._on_uni_spread(g("uni_spread"))
 
     # ── File dialog helpers ───────────────────────────────────────────
 
@@ -1744,6 +2027,22 @@ class SynthUI:
             "Z1:", LATENT_MIN, LATENT_MAX, 0.0, self._on_z1_scan, res=0.01,
             cc_key="z1")
 
+        # ── Vel → Latent section ──────────────────────────────────────
+        tk.Frame(inner, bg=MAC_SHADOW, height=1).pack(fill="x", pady=(4, 2))
+
+        velz_top = tk.Frame(inner, bg=MAC_BG)
+        velz_top.pack(fill="x")
+        tk.Label(velz_top, text="Vel→Z", font=FONT_TINY,
+                 fg=MAC_BLACK, bg=MAC_BG).pack(side="left")
+
+        self._vel_depth_sl, self._vel_depth_lbl = make_row(
+            "Depth:", 0, 200, 0, self._on_vel_depth, res=1, cc_key="vel_depth")
+        self._vel_angle_sl, self._vel_angle_lbl = make_row(
+            "Angle:", 0, 360, 0, self._on_vel_angle, res=1, cc_key="vel_angle")
+
+        self._on_vel_depth(0)
+        self._on_vel_angle(0)
+
         # Randomize button
         rand_row = tk.Frame(inner, bg=MAC_BG)
         rand_row.pack(fill="x", pady=(4, 0))
@@ -1891,6 +2190,16 @@ class SynthUI:
             self._update_scan_sliders(x, y)
         else:
             self._move_to_latent(x, y)
+
+    def _on_vel_depth(self, val):
+        d = float(val) / 100.0   # slider 0–200 → 0.0–2.0 latent units
+        self.synth.set_vel_latent_depth(d)
+        self._vel_depth_lbl.config(text=f"{d:.2f}")
+
+    def _on_vel_angle(self, val):
+        deg = float(val)
+        self.synth.set_vel_latent_angle(deg)
+        self._vel_angle_lbl.config(text=f"{deg:.0f}°")
 
     # ------------------------------------------------------------------
     # Arpeggiator panel
@@ -2054,6 +2363,149 @@ class SynthUI:
                 lbl.config(font=("Monaco", 8, "bold"))
             else:
                 lbl.config(font=FONT_TINY)
+
+    # ------------------------------------------------------------------
+    # FX panel  (Reverb + Delay)
+    # ------------------------------------------------------------------
+
+    def _build_fx_panel(self, parent):
+        _, body = self._make_collapsible_panel(
+            parent, "◆ FX", pady=(0, 6), start_open=False)
+
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
+
+        def make_row(label, from_, to, init, cmd, res=0, cc_key=None):
+            row = tk.Frame(inner, bg=MAC_BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
+                     bg=MAC_BG, width=11, anchor="w").pack(side="left")
+            s = mac_slider(row, from_=from_, to=to, command=cmd,
+                           length=100, orient=tk.HORIZONTAL, resolution=res)
+            s.set(init)
+            s.pack(side="left")
+            lbl = tk.Label(row, text="", font=FONT_TINY,
+                           fg=MAC_BLACK, bg=MAC_BG, width=8, anchor="w")
+            lbl.pack(side="left", padx=(3, 0))
+            if cc_key:
+                self._bind_cc_rclick(s, cc_key)
+            return s, lbl
+
+        # Reverb sub-header
+        tk.Label(inner, text="Reverb", font=FONT_TINY,
+                 fg=MAC_SHADOW, bg=MAC_BG).pack(anchor="w", pady=(0, 1))
+
+        self._rev_size_sl, self._rev_size_lbl = make_row(
+            "Size:", 0, 100, 50, self._on_rev_size, cc_key="rev_size")
+        self._rev_damp_sl, self._rev_damp_lbl = make_row(
+            "Damp:", 0, 100, 50, self._on_rev_damp, cc_key="rev_damp")
+        self._rev_wet_sl,  self._rev_wet_lbl  = make_row(
+            "Wet:", 0, 100, 0,  self._on_rev_wet,  cc_key="rev_wet")
+
+        tk.Frame(inner, bg=MAC_SHADOW, height=1).pack(fill="x", pady=(4, 2))
+
+        # Delay sub-header
+        tk.Label(inner, text="Delay", font=FONT_TINY,
+                 fg=MAC_SHADOW, bg=MAC_BG).pack(anchor="w", pady=(0, 1))
+
+        self._dly_time_sl,  self._dly_time_lbl  = make_row(
+            "Time:", 20, 1000, 250, self._on_dly_time, res=1, cc_key="dly_time")
+        self._dly_fb_sl,    self._dly_fb_lbl    = make_row(
+            "Feedback:", 0, 90, 40, self._on_dly_fb, cc_key="dly_fb")
+        self._dly_wet_sl,   self._dly_wet_lbl   = make_row(
+            "Wet:", 0, 100, 0, self._on_dly_wet, cc_key="dly_wet")
+
+        # Apply defaults
+        self._on_rev_size(50); self._on_rev_damp(50); self._on_rev_wet(0)
+        self._on_dly_time(250); self._on_dly_fb(40); self._on_dly_wet(0)
+
+    # FX callbacks
+    def _on_rev_size(self, val):
+        v = float(val) / 100.0
+        self.synth.set_reverb_size(v)
+        self._rev_size_lbl.config(text=f"{int(float(val))}%")
+
+    def _on_rev_damp(self, val):
+        v = float(val) / 100.0
+        self.synth.set_reverb_damp(v)
+        self._rev_damp_lbl.config(text=f"{int(float(val))}%")
+
+    def _on_rev_wet(self, val):
+        v = float(val) / 100.0
+        self.synth.set_reverb_wet(v)
+        self._rev_wet_lbl.config(text=f"{int(float(val))}%")
+
+    def _on_dly_time(self, val):
+        ms = float(val)
+        self.synth.set_delay_time(ms)
+        self._dly_time_lbl.config(text=f"{ms:.0f}ms")
+
+    def _on_dly_fb(self, val):
+        v = float(val) / 100.0
+        self.synth.set_delay_feedback(v)
+        self._dly_fb_lbl.config(text=f"{int(float(val))}%")
+
+    def _on_dly_wet(self, val):
+        v = float(val) / 100.0
+        self.synth.set_delay_wet(v)
+        self._dly_wet_lbl.config(text=f"{int(float(val))}%")
+
+    # ------------------------------------------------------------------
+    # Voices panel  (Unison)
+    # ------------------------------------------------------------------
+
+    def _build_voices_panel(self, parent):
+        _, body = self._make_collapsible_panel(
+            parent, "◆ Voices", pady=(0, 6), start_open=False)
+
+        inner = tk.Frame(body, bg=MAC_BG)
+        inner.pack(padx=6, pady=(0, 4), fill="x")
+
+        def make_row(label, from_, to, init, cmd, res=0, cc_key=None):
+            row = tk.Frame(inner, bg=MAC_BG)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, font=FONT_TINY, fg=MAC_BLACK,
+                     bg=MAC_BG, width=11, anchor="w").pack(side="left")
+            s = mac_slider(row, from_=from_, to=to, command=cmd,
+                           length=100, orient=tk.HORIZONTAL, resolution=res)
+            s.set(init)
+            s.pack(side="left")
+            lbl = tk.Label(row, text="", font=FONT_TINY,
+                           fg=MAC_BLACK, bg=MAC_BG, width=8, anchor="w")
+            lbl.pack(side="left", padx=(3, 0))
+            if cc_key:
+                self._bind_cc_rclick(s, cc_key)
+            return s, lbl
+
+        tk.Label(inner, text="Unison", font=FONT_TINY,
+                 fg=MAC_SHADOW, bg=MAC_BG).pack(anchor="w", pady=(0, 1))
+
+        self._uni_voices_sl, self._uni_voices_lbl = make_row(
+            "Voices:", 1, 7, 1, self._on_uni_voices, res=1, cc_key="uni_voices")
+        self._uni_detune_sl, self._uni_detune_lbl = make_row(
+            "Detune:", 0, 100, 20, self._on_uni_detune, cc_key="uni_detune")
+        self._uni_spread_sl, self._uni_spread_lbl = make_row(
+            "Spread:", 0, 200, 0, self._on_uni_spread, res=1, cc_key="uni_spread")
+
+        self._on_uni_voices(1)
+        self._on_uni_detune(20)
+        self._on_uni_spread(0)
+
+    # Voices callbacks
+    def _on_uni_voices(self, val):
+        n = int(float(val))
+        self.synth.set_unison_voices(n)
+        self._uni_voices_lbl.config(text=str(n))
+
+    def _on_uni_detune(self, val):
+        ct = float(val)
+        self.synth.set_unison_detune(ct)
+        self._uni_detune_lbl.config(text=f"{ct:.0f}ct")
+
+    def _on_uni_spread(self, val):
+        v = float(val) / 100.0   # slider 0–200 → 0.0–2.0 latent units
+        self.synth.set_unison_spread(v)
+        self._uni_spread_lbl.config(text=f"{v:.2f}")
 
     # ------------------------------------------------------------------
     # I/O panel
@@ -2946,6 +3398,64 @@ class SynthUI:
                 "F.Release", 0, 100,
                 lambda v: root.after(
                     0, lambda: (self._frel.set(v), self._apply_filter_adsr())),
+            ),
+            # Effects
+            "rev_size": (
+                "Rev Size", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._rev_size_sl.set(v), self._on_rev_size(v))),
+            ),
+            "rev_damp": (
+                "Rev Damp", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._rev_damp_sl.set(v), self._on_rev_damp(v))),
+            ),
+            "rev_wet": (
+                "Rev Wet", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._rev_wet_sl.set(v), self._on_rev_wet(v))),
+            ),
+            "dly_time": (
+                "Dly Time", 20, 1000,
+                lambda v: root.after(
+                    0, lambda: (self._dly_time_sl.set(v), self._on_dly_time(v))),
+            ),
+            "dly_fb": (
+                "Dly Feedback", 0, 90,
+                lambda v: root.after(
+                    0, lambda: (self._dly_fb_sl.set(v), self._on_dly_fb(v))),
+            ),
+            "dly_wet": (
+                "Dly Wet", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._dly_wet_sl.set(v), self._on_dly_wet(v))),
+            ),
+            # Vel → latent
+            "vel_depth": (
+                "Vel Depth", 0, 200,
+                lambda v: root.after(
+                    0, lambda: (self._vel_depth_sl.set(v), self._on_vel_depth(v))),
+            ),
+            "vel_angle": (
+                "Vel Angle", 0, 360,
+                lambda v: root.after(
+                    0, lambda: (self._vel_angle_sl.set(v), self._on_vel_angle(v))),
+            ),
+            # Unison
+            "uni_voices": (
+                "Uni Voices", 1, 7,
+                lambda v: root.after(
+                    0, lambda: (self._uni_voices_sl.set(v), self._on_uni_voices(v))),
+            ),
+            "uni_detune": (
+                "Uni Detune", 0, 100,
+                lambda v: root.after(
+                    0, lambda: (self._uni_detune_sl.set(v), self._on_uni_detune(v))),
+            ),
+            "uni_spread": (
+                "Uni Spread", 0, 200,
+                lambda v: root.after(
+                    0, lambda: (self._uni_spread_sl.set(v), self._on_uni_spread(v))),
             ),
         }
         if key not in defs:
