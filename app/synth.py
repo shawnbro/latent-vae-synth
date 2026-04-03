@@ -38,6 +38,12 @@ except Exception:
     print("Warning: pygame.midi unavailable. MIDI input disabled.")
 
 
+def _bundle_path(rel: str) -> str:
+    """Resolve a path relative to the PyInstaller bundle root (or script dir when not frozen)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -85,7 +91,7 @@ KB_VELOCITY_STEP    = 10
 
 CC_MAP_PATH        = os.path.expanduser("~/.latent_synth_cc.json")
 SETTINGS_PATH      = os.path.expanduser("~/.latent_synth_settings.json")
-LATENT_INDEX_PATH  = "export/latent_index.npz"
+LATENT_INDEX_PATH  = _bundle_path("export/latent_index.npz")
 PRESETS_DIR        = os.path.expanduser("~/Documents/LatentSynth/Presets")
 
 
@@ -3567,7 +3573,7 @@ class SynthUI:
 
 def main():
     parser = argparse.ArgumentParser(description="Latent wavetable synthesizer")
-    parser.add_argument("--model", default="export/decoder.onnx",
+    parser.add_argument("--model", default=_bundle_path("export/decoder.onnx"),
                         help="Path to decoder ONNX model")
     args = parser.parse_args()
 
