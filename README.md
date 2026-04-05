@@ -1,8 +1,8 @@
-# Latent Synth
+# neural-wavetable
 
-A neural wavetable synthesizer. A Variational Autoencoder (VAE) is trained on thousands of single-cycle waveforms, compressing them into a smooth 2D latent space. At runtime, an XY pad navigates that space in real time — every position decodes to a unique waveform, and moving through it morphs the timbre continuously.
+A VAE trained on thousands of single-cycle waveforms, compressing them into a smooth 2D latent space. At runtime, an XY pad navigates that space — every position decodes to a unique waveform, and moving through it morphs the timbre continuously.
 
-Available as a **native VST3/AU plugin** (JUCE + ONNX Runtime, no Python at runtime) and as a **Python standalone app**.
+This repo covers the **model** (training, export, Python standalone app). The native **VST3/AU plugin** lives at [latent-synth-plugin](https://github.com/shawnbroukhim/latent-synth-plugin).
 
 ![Latent space colored by waveform category](plots/latent_ep200_categories.png)
 
@@ -33,65 +33,9 @@ AKWF waveforms  →  VAE encoder  →  2D latent space  →  VAE decoder  →  w
 
 ## Plugin (VST3 / AU)
 
-### Quickstart — pre-built assets included
+→ **[latent-synth-plugin](https://github.com/shawnbroukhim/latent-synth-plugin)**
 
-```bash
-git clone <repo-url>
-cd latent-vst/plugin
-
-# Download ONNX Runtime 1.20.1 for macOS arm64 and unpack into vendor/
-# https://github.com/microsoft/onnxruntime/releases/tag/v1.20.1
-# → onnxruntime-osx-arm64-1.20.1.tgz → extract to plugin/vendor/
-
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-
-# Install
-cp -r LatentSynth_artefacts/Release/VST3/Latent\ Synth.vst3 \
-      ~/Library/Audio/Plug-Ins/VST3/
-cp -r LatentSynth_artefacts/Release/AU/Latent\ Synth.component \
-      ~/Library/Audio/Plug-Ins/Components/
-```
-
-`plugin/Assets/decoder.onnx` and `plugin/Assets/latent_index.npz` are embedded at build time via JUCE's BinaryData mechanism — no external files needed at runtime.
-
-### Features
-
-| Section | Controls |
-|---------|----------|
-| **Latent Space** | XY pad + dedicated X / Y sliders |
-| **MIDI CC** | CC1 (mod wheel) → X, CC11 (expression) → Y; all params DAW-automatable |
-| **Envelope** | ADSR (1 ms – 8 s) |
-| **Filter** | 4-pole resonant lowpass (24 dB/oct), envelope mod amount |
-| **Motion** | LFO on/off, shape (Circ / X Scan / Y Scan / Walk / Wave), Rate, Depth, Glide, Vel Depth, Vel Angle |
-| **Voices** | Unison count (1–8), detune spread (0–100 ¢) |
-| **Reverb** | Freeverb (8 comb + 4 allpass), room size + wet |
-| **Delay** | Feedback delay, time + feedback + wet |
-| **I/O** | Master gain |
-
-**LFO shapes**
-
-| Shape | Behaviour |
-|-------|-----------|
-| Circ | Circular orbit around the center point |
-| X Scan | Sinusoidal sweep on X axis |
-| Y Scan | Sinusoidal sweep on Y axis |
-| Walk | Ornstein-Uhlenbeck random walk (mean-reverts to center) |
-| Wave | Uses the current decoded waveform as an LFO shape |
-
-**Velocity → Latent** — at noteOn, the waveform is decoded from a point offset from the current XY position by `Vel Depth` latent units in the direction of `Vel Angle`. At velocity 0 the center waveform is used; at velocity 127 the full offset is applied, giving per-note timbre variation.
-
-**Unison** — each note spawns N voices with detune spread symmetrically around 0¢. All voices share the same MIDI note so they release together.
-
-**Glide** — cross-fades between the previous and new waveform over the specified time (0–2000 ms), so moving the XY pad or LFO smoothly morphs the timbre rather than switching abruptly.
-
-### Architecture notes
-
-- ONNX inference runs on the **message thread** (30 Hz timer), never the audio thread — eliminating dropout and priority-inversion issues
-- Velocity→latent and LFO position updates decode a new waveform at each noteOn / timer tick
-- Filter is a 4-pole transposed direct form II biquad (two cascaded RBJ lowpass stages); state is preserved across coefficient changes for click-free cutoff modulation
-- `plugin/build/` and `vendor/*/lib/` (the 33 MB dylib) are gitignored; everything else is in-tree
+JUCE 8 + ONNX Runtime, no Python at runtime. Embeds `decoder.onnx` and `latent_index.npz` directly in the binary at build time.
 
 ---
 
@@ -200,11 +144,11 @@ python export/export.py --checkpoint model/checkpoints/best.pt
 Validates ONNX output against PyTorch and benchmarks inference latency. Target: < 1 ms per waveform.
 
 ```bash
-# Convert to inline format (required for embedding in the plugin via BinaryData)
+# Convert to single-file inline format (required by the plugin — copy to latent-synth-plugin/Assets/)
 python -c "
 import onnx
 m = onnx.load('export/decoder.onnx')
-onnx.save_model(m, 'plugin/Assets/decoder.onnx', save_as_external_data=False)
+onnx.save_model(m, 'export/decoder_inline.onnx', save_as_external_data=False)
 "
 ```
 
@@ -212,16 +156,9 @@ onnx.save_model(m, 'plugin/Assets/decoder.onnx', save_as_external_data=False)
 
 ```bash
 python export/build_latent_index.py
-cp export/latent_index.npz plugin/Assets/latent_index.npz
 ```
 
-Encodes all waveforms and saves their 2D coordinates for nearest-neighbour waveform name lookup. Re-run after retraining.
-
-### 6. Rebuild the plugin
-
-```bash
-cd plugin/build && cmake --build . --config Release
-```
+Encodes all waveforms and saves their 2D coordinates to `export/latent_index.npz` for nearest-neighbour waveform name lookup. Re-run after retraining. Copy both files to `latent-synth-plugin/Assets/` to rebuild the plugin against the new model.
 
 ---
 
@@ -278,7 +215,6 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 │   ├── build_latent_index.py # Build waveform name lookup index
 │   ├── decoder.onnx          # Exported model graph
 │   ├── decoder.onnx.data     # Model weights (1.3 MB)
-│   ├── decoder_inline.onnx   # Same, single-file (for plugin BinaryData)
 │   └── latent_index.npz      # Latent coords for 45K waveforms
 ├── model/
 │   ├── vae.py                # VAE architecture
@@ -289,25 +225,7 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 │       └── train_log.csv     # Loss history
 ├── notebooks/
 │   └── visualize_latent.py   # Latent space plots
-├── packaging/
-│   └── latent_synth.spec     # PyInstaller spec for standalone .app
 ├── plots/                    # Generated visualizations
-├── plugin/
-│   ├── CMakeLists.txt        # JUCE 8 + ONNX Runtime CMake build
-│   ├── Assets/               # decoder.onnx + latent_index.npz (embedded)
-│   ├── Source/
-│   │   ├── PluginProcessor.h/cpp   # AudioProcessor, APVTS, MIDI, timer
-│   │   ├── PluginEditor.h/cpp      # Mac Classic UI, XY pad, sections
-│   │   └── dsp/
-│   │       ├── LatentSynth.h       # Engine: ONNX session, voice pool
-│   │       ├── Voice.h             # Wavetable osc + ADSR + filter
-│   │       ├── BiquadFilter.h      # 4-pole resonant LP (TDFII)
-│   │       ├── LatentLFO.h         # Background LFO thread (5 shapes)
-│   │       ├── SchroederReverb.h   # Freeverb topology
-│   │       ├── FeedbackDelay.h     # Stereo delay
-│   │       └── ADSREnvelope.h      # State-machine ADSR
-│   └── vendor/
-│       └── onnxruntime-osx-arm64-1.20.1/  # Headers + cmake (dylib gitignored)
 └── CLAUDE.md                 # Project spec & working notes
 ```
 
@@ -315,12 +233,6 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 
 ## Dependencies
 
-### Plugin (C++)
-- JUCE 8 (fetched automatically via CMake FetchContent)
-- ONNX Runtime 1.20.1 (arm64 macOS — download separately, place in `plugin/vendor/`)
-- Xcode CLT / CMake 3.22+
-
-### Python app
 - Python 3.13
 - PyTorch 2.10 + torchaudio
 - soundfile, onnx, onnxruntime, sounddevice, pygame, scipy, matplotlib
@@ -344,8 +256,7 @@ L = MSE(recon, target) + β · KL(q(z|x) || N(0,I))
 - Arpeggiator port to the plugin
 
 **Distribution**
-- Windows / Linux builds (ONNX Runtime is cross-platform; JUCE handles the rest)
-- Code-sign with a Developer ID for Gatekeeper-free distribution
+- See [latent-synth-plugin](https://github.com/shawnbroukhim/latent-synth-plugin) for VST3/AU packaging
 
 ---
 
